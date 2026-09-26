@@ -110,16 +110,15 @@ const ImageBody = z.object({
     .max(300),
 
   /*
-   * The Facebook headline is passed separately from the
-   * image prompt so the image generator can render the
-   * headline inside the final image.
+   * REQUIRED:
+   * This is the exact Facebook headline that must appear
+   * inside the final generated image.
    */
   title: z
     .string()
     .trim()
     .min(1)
-    .max(120)
-    .optional(),
+    .max(120),
 
   source: z.enum([
     "ai",

@@ -1,4 +1,3 @@
-```ts
 import { env } from "@/lib/env";
 import type { ContentProvider, GeneratedContent } from "@/lib/types";
 
@@ -304,4 +303,4 @@ export async function generateContent(
     providerError: failures.join(" | "),
   };
 }
-```
+

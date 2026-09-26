@@ -60,62 +60,30 @@ const PHOTO_STYLE = [
   "no grid",
 ].join(", ");
 
+// CHANGED: Prompt ini sekarang meminta Gemini untuk TIDAK membuat teks sama sekali
 function buildGeminiPrompt(
   prompt: string,
   title?: string
 ): string {
-  const headline =
-    title?.trim() || "";
-
   return [
     "Create a high-quality square social media photograph.",
-
     "",
-
     "VISUAL CONCEPT:",
     prompt.trim(),
-
     "",
-
-    "HEADLINE TEXT INSIDE THE IMAGE:",
-    headline
-      ? `"${headline}"`
-      : "Create a short relevant headline based on the visual concept.",
-
+    "IMPORTANT:",
+    "- DO NOT add any text, letters, words, captions, or headlines inside the image.",
+    "- The image MUST be completely clean without any typography.",
+    "- Do not add logos. Do not add watermarks.",
     "",
-
-    "TEXT OVERLAY REQUIREMENTS:",
-    "- The headline MUST be visibly rendered inside the image.",
-    "- Use the exact headline wording whenever possible.",
-    "- The headline must be clearly readable on a mobile phone.",
-    "- Use large, bold, professional typography.",
-    "- Choose typography that matches the mood of the photograph.",
-    "- Place the headline naturally within the composition.",
-    "- Prefer the lower third or another area with sufficient negative space.",
-    "- Do not cover the main subject or important facial features.",
-    "- Use a subtle dark or light semi-transparent contrast box when necessary.",
-    "- Use strong contrast between the headline and background.",
-    "- Correct spelling is required.",
-    "- Natural capitalization is required.",
-    "- Do not add hashtags to the image.",
-    "- Do not add URLs to the image.",
-    "- Do not add logos.",
-    "- Do not add watermarks.",
-    "- Do not add unrelated text.",
-
-    "",
-
     "VISUAL STYLE:",
     PHOTO_STYLE,
-
     "",
-
     "COMPOSITION:",
     "- 1:1 square composition.",
     "- Designed for a Facebook mobile feed.",
     "- Strong visual hierarchy.",
     "- Main subject should remain visually dominant.",
-    "- Headline should be immediately noticeable but not overpower the photograph.",
     "- Professional viral social-media photography aesthetic.",
   ].join("\n");
 }
@@ -682,79 +650,38 @@ function wrapHeadline(
 // HEADLINE SVG
 // ============================================================
 
+// CHANGED: Fungsi ini dirombak total agar tidak ada kotak hitam transparan,
+// dan menggunakan teks putih besar dengan garis tepi (stroke) hitam tebal.
 function createHeadlineSvg(
   title: string
 ): Buffer {
-  const cleanTitle =
-    title
-      .trim()
-      .replace(/\s+/g, " ");
+  const cleanTitle = title.trim().replace(/\s+/g, " ");
 
   if (!cleanTitle) {
-    throw new Error(
-      "Headline title is empty"
-    );
+    throw new Error("Headline title is empty");
   }
 
-  const lines =
-    wrapHeadline(
-      cleanTitle,
-      22
-    );
+  const lines = wrapHeadline(cleanTitle, 22);
 
   if (lines.length === 0) {
-    throw new Error(
-      "Unable to create headline overlay"
-    );
+    throw new Error("Unable to create headline overlay");
   }
 
-  const fontSize =
-    lines.length === 1
-      ? 72
-      : lines.length === 2
-        ? 66
-        : 58;
+  // Ukuran font yang lebih besar untuk visibilitas mobile
+  const fontSize = lines.length === 1 ? 96 : lines.length === 2 ? 82 : 68;
+  const lineHeight = fontSize + 16;
 
-  const lineHeight =
-    fontSize + 12;
+  // POSISI TEKS:
+  // Teks di bawah (seperti contoh gambar 2). 
+  // Jika ingin di atas (seperti gambar 3 & 4), ubah baris ini menjadi: const textStartY = 150;
+  const textStartY = FINAL_HEIGHT - (lines.length * lineHeight) - 60;
 
-  const boxPaddingX =
-    42;
-
-  const boxPaddingY =
-    30;
-
-  const boxWidth =
-    FINAL_WIDTH -
-    80;
-
-  const textBlockHeight =
-    lines.length *
-      lineHeight;
-
-  const boxHeight =
-    textBlockHeight +
-    boxPaddingY * 2;
-
-  const boxX = 40;
-
-  const boxY =
-    FINAL_HEIGHT -
-    boxHeight -
-    55;
-
-  const textStartY =
-    boxY +
-    boxPaddingY +
-    fontSize;
-
-  const escapedLines =
-    lines.map(
-      (line) =>
-        `<tspan x="540" dy="${line === lines[0] ? 0 : lineHeight}">${escapeXml(
-          line.toUpperCase()
-        )}</tspan>`
-    );
+  const escapedLines = lines.map(
+    (line, index) =>
+      `<tspan x="540" dy="${index === 0 ? 0 : lineHeight}">${escapeXml(
+        line.toUpperCase()
+      )}</tspan>`
+  );
 
   const svg = `
 <svg
@@ -764,32 +691,11 @@ function createHeadlineSvg(
   xmlns="http://www.w3.org/2000/svg"
 >
   <defs>
-    <filter
-      id="shadow"
-      x="-20%"
-      y="-20%"
-      width="140%"
-      height="140%"
-    >
-      <feDropShadow
-        dx="0"
-        dy="3"
-        stdDeviation="4"
-        flood-color="#000000"
-        flood-opacity="0.55"
-      />
+    <!-- Bayangan tebal agar kontras dengan background -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="6" flood-color="#000000" flood-opacity="0.8" />
     </filter>
   </defs>
-
-  <rect
-    x="${boxX}"
-    y="${boxY}"
-    width="${boxWidth}"
-    height="${boxHeight}"
-    rx="28"
-    fill="#000000"
-    fill-opacity="0.68"
-  />
 
   <text
     x="540"
@@ -800,7 +706,8 @@ function createHeadlineSvg(
     font-weight="900"
     fill="#ffffff"
     stroke="#000000"
-    stroke-width="1"
+    stroke-width="12"
+    stroke-linejoin="round"
     paint-order="stroke"
     filter="url(#shadow)"
   >
@@ -809,10 +716,7 @@ function createHeadlineSvg(
 </svg>
 `;
 
-  return Buffer.from(
-    svg,
-    "utf8"
-  );
+  return Buffer.from(svg, "utf8");
 }
 
 // ============================================================
@@ -1180,4 +1084,3 @@ async function upload(
     source,
   };
 }
-

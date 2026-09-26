@@ -137,16 +137,15 @@ export default function GeneratePage() {
       /*
        * =====================================================
        * STEP 1
+       *
        * Generate:
        * - viral Facebook title
        * - description
        * - hashtags
        * - AI image prompt
        *
-       * IMPORTANT:
-       * The image prompt comes from the AI.
-       * We do NOT send the original topic directly
-       * to the image generator anymore.
+       * The title will also be used as the headline
+       * inside the generated image.
        * =====================================================
        */
 
@@ -176,7 +175,8 @@ export default function GeneratePage() {
                   contentJson as {
                     error?: unknown;
                   }
-                ).error ?? "Content generation failed."
+                ).error ??
+                  "Content generation failed."
               )
             : "Content generation failed.";
 
@@ -199,6 +199,21 @@ export default function GeneratePage() {
       }
 
       /*
+       * Make sure the AI returned a title.
+       *
+       * The title is important because it will be
+       * displayed inside the generated image.
+       */
+      if (
+        !contentData.title ||
+        !contentData.title.trim()
+      ) {
+        throw new Error(
+          "AI generated the content but did not return a title for the image headline."
+        );
+      }
+
+      /*
        * Show generated content immediately.
        */
       setContent(contentData);
@@ -213,10 +228,24 @@ export default function GeneratePage() {
         contentData.imagePrompt
       );
 
+      console.info(
+        "[GeneratePage] Image headline:",
+        contentData.title
+      );
+
       /*
        * =====================================================
        * STEP 2
-       * Generate image using the AI-generated imagePrompt.
+       *
+       * Generate image using:
+       *
+       * - AI-generated image prompt
+       * - AI-generated title
+       *
+       * The title is sent separately so the server-side
+       * Gemini image generator can explicitly instruct
+       * the image model to render the headline inside
+       * the image.
        * =====================================================
        */
 
@@ -228,7 +257,18 @@ export default function GeneratePage() {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            prompt: contentData.imagePrompt,
+            prompt:
+              contentData.imagePrompt,
+
+            /*
+             * IMPORTANT:
+             * This is the Facebook title/headline
+             * that should appear visibly inside
+             * the generated image.
+             */
+            title:
+              contentData.title,
+
             source: imagePref,
           }),
         }
@@ -247,7 +287,8 @@ export default function GeneratePage() {
                   imageJson as {
                     error?: unknown;
                   }
-                ).error ?? "Image generation failed."
+                ).error ??
+                  "Image generation failed."
               )
             : "Image generation failed.";
 
@@ -384,10 +425,6 @@ export default function GeneratePage() {
             /*
              * Keep the AI-generated image prompt
              * available in the request.
-             *
-             * This is harmless if the API currently
-             * ignores it, and makes it available for
-             * future persistence.
              */
             imagePrompt:
               content.imagePrompt,
@@ -739,8 +776,9 @@ export default function GeneratePage() {
 
             <p className="mt-2 text-xs text-muted-foreground">
               AI Generated uses the AI-created
-              image prompt from your generated
-              Facebook content.
+              image prompt and generated title.
+              The title is instructed to appear
+              as a headline inside the image.
             </p>
           </div>
 
@@ -864,6 +902,12 @@ export default function GeneratePage() {
                   rows={3}
                   className="mt-2 w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary"
                 />
+
+                <p className="mt-1 text-xs text-muted-foreground">
+                  This title is also used as the
+                  headline inside the AI-generated
+                  image.
+                </p>
               </div>
 
               <div>
@@ -981,9 +1025,10 @@ export default function GeneratePage() {
 
                 <p className="mt-1 text-xs text-muted-foreground">
                   This prompt is sent to the
-                  image generator. You can edit it
-                  and regenerate the image if
-                  needed.
+                  image generator. The generated
+                  title is separately sent as the
+                  headline that should appear inside
+                  the image.
                 </p>
               </div>
 

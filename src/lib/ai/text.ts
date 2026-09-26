@@ -1,18 +1,67 @@
 import { env } from "@/lib/env";
 import type { ContentProvider, GeneratedContent } from "@/lib/types";
 
-const SYSTEM_PROMPT = `You are an expert Facebook Page copywriter. Given a topic, write a single
-high-performing Facebook photo post in strict JSON with this exact shape and nothing else:
-{"title": string, "description": string, "hashtags": string[]}
+const SYSTEM_PROMPT = `You are an expert Facebook Page copywriter and viral social media content strategist.
 
-The three parts are joined into one caption, in that order, so they must read as
-one post rather than three fragments.
+Given a topic, create ONE engaging Facebook photo post and a matching AI image prompt.
+
+Return STRICT JSON with exactly this shape and nothing else:
+{
+  "title": string,
+  "description": string,
+  "hashtags": string[],
+  "imagePrompt": string
+}
+
+The title, description and hashtags together form ONE complete Facebook caption.
 
 Rules:
-- title: the opening hook, <= 80 characters. Conversational, scroll-stopping, specific. At most one emoji. No hashtags.
-- description: 2-4 short sentences, <= 400 characters, written to be read on a phone. Plain language, no marketing cliches. End with a question or a soft call to action that invites comments.
-- hashtags: 3 to 5 short, highly relevant hashtags, lowercase, no "#" symbol, no spaces.
-- Output ONLY the JSON object. No markdown fences, no commentary.`;
+
+TITLE:
+- Opening hook that immediately attracts attention.
+- <= 80 characters.
+- Conversational, emotional and scroll-stopping.
+- Specific to the topic.
+- At most one emoji.
+- No hashtags.
+- Avoid fake claims or misleading clickbait.
+
+DESCRIPTION:
+- 2-4 short sentences.
+- <= 400 characters.
+- Easy to read on a mobile phone.
+- Natural conversational language.
+- Create curiosity and emotional engagement.
+- Do not use generic marketing clichés.
+- Do not repeat the title.
+- End with a question or soft call-to-action that encourages comments.
+- Stay factually reasonable and do not invent specific facts.
+
+HASHTAGS:
+- 3 to 5 highly relevant hashtags.
+- Lowercase.
+- No "#" symbol.
+- No spaces inside a hashtag.
+- Mix broad and specific hashtags when appropriate.
+
+IMAGEPROMPT:
+- Write a detailed image-generation prompt in ENGLISH.
+- The image must directly match the title and description.
+- Describe the main subject, environment, composition, lighting, atmosphere, camera/photo style and important visual details.
+- Make it visually striking and suitable for a Facebook viral photo post.
+- Prefer realistic photography unless the topic clearly requires another style.
+- Use cinematic composition and natural lighting when appropriate.
+- Square composition suitable for social media.
+- Do NOT include text, captions, logos, watermarks or UI elements inside the image.
+- Do not describe fake screenshots or social media interfaces.
+- The image should communicate the story visually without requiring text.
+
+IMPORTANT:
+- The caption and image must tell the SAME story.
+- Do not create an unrelated image.
+- Output ONLY the JSON object.
+- No markdown fences.
+- No commentary.`;
 
 const TIMEOUT_MS = 20_000;
 
@@ -40,9 +89,16 @@ function parseContent(raw: string): GeneratedContent {
     typeof o.title !== "string" ||
     typeof o.description !== "string" ||
     !Array.isArray(o.hashtags) ||
-    !o.hashtags.every((h) => typeof h === "string")
+    !o.hashtags.every((h) => typeof h === "string") ||
+    typeof o.imagePrompt !== "string"
   ) {
     throw new Error("Malformed generation payload");
+  }
+
+  const imagePrompt = o.imagePrompt.trim();
+
+  if (!imagePrompt) {
+    throw new Error("AI returned an empty imagePrompt");
   }
 
   return {
@@ -51,6 +107,7 @@ function parseContent(raw: string): GeneratedContent {
     hashtags: (o.hashtags as string[])
       .map((h) => h.replace(/^#/, "").trim())
       .filter(Boolean),
+    imagePrompt,
   };
 }
 
@@ -93,7 +150,9 @@ async function groqCompletion(
   const body = await res.text();
 
   if (!res.ok) {
-    throw new Error(`Groq ${model} responded ${res.status}: ${body.slice(0, 300)}`);
+    throw new Error(
+      `Groq ${model} responded ${res.status}: ${body.slice(0, 300)}`
+    );
   }
 
   const data = JSON.parse(body);
@@ -104,7 +163,9 @@ async function groqCompletion(
         ? data.error
         : data.error?.message;
 
-    throw new Error(`Groq ${model}: ${message ?? "unknown error"}`);
+    throw new Error(
+      `Groq ${model}: ${message ?? "unknown error"}`
+    );
   }
 
   const content: unknown =
@@ -153,7 +214,9 @@ async function geminiCompletion(
   const body = await res.text();
 
   if (!res.ok) {
-    throw new Error(`Gemini responded ${res.status}: ${body.slice(0, 300)}`);
+    throw new Error(
+      `Gemini responded ${res.status}: ${body.slice(0, 300)}`
+    );
   }
 
   const data = JSON.parse(body);
@@ -168,6 +231,11 @@ async function geminiCompletion(
   return content;
 }
 
+/**
+ * Local fallback.
+ *
+ * Used only when Groq and Gemini are unavailable or fail.
+ */
 function template(topic: string): GeneratedContent {
   const clean = topic.trim();
 
@@ -181,11 +249,16 @@ function template(topic: string): GeneratedContent {
     title: `${clean} — worth a look today`,
     description:
       `We put together a few ideas around ${clean.toLowerCase()}. ` +
-      `Simple things you can actually try this week. ` +
-      `Which one would you start with?`,
+      `Simple things you can actually explore today. ` +
+      `What do you think about it?`,
     hashtags: [...new Set(words)]
       .concat(["ideas"])
       .slice(0, 5),
+    imagePrompt:
+      `A realistic cinematic photograph related to ${clean}, ` +
+      `visually compelling composition, natural lighting, ` +
+      `high detail, realistic photography, square composition, ` +
+      `no text, no logo, no watermark.`,
   };
 }
 
@@ -202,7 +275,7 @@ function providerChain(topic: string): Attempt[] {
 
   if (groqKey) {
     /**
-     * Current Groq production models.
+     * Groq production models.
      *
      * GPT OSS 120B is the primary model.
      * GPT OSS 20B is the smaller fallback.
@@ -222,7 +295,7 @@ function providerChain(topic: string): Attempt[] {
   }
 
   /**
-   * Gemini is a text fallback only.
+   * Gemini is a text fallback.
    */
   const geminiKey = env.geminiApiKey;
 
@@ -234,11 +307,7 @@ function providerChain(topic: string): Attempt[] {
   }
 
   /**
-   * IMPORTANT:
    * Pollinations has intentionally been removed.
-   *
-   * If Groq and Gemini fail, return a deterministic template instead
-   * of silently using another external AI provider.
    */
   return chain;
 }
@@ -268,6 +337,12 @@ export async function generateContent(
       console.info(
         `[generateContent] provider=${provider}` +
           `${model ? ` model=${model}` : ""}`
+      );
+
+      console.info(
+        `[generateContent] imagePrompt generated=${Boolean(
+          parsed.imagePrompt
+        )}`
       );
 
       return {

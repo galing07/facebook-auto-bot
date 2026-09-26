@@ -1,16 +1,29 @@
 /**
  * Centralised, typed access to environment variables.
- * Throws a clear error at the call site instead of a silent `undefined`
- * turning into a confusing failure three layers down.
+ *
+ * AI provider configuration:
+ *
+ * Text:
+ *   1. Groq
+ *   2. Gemini
+ *   3. Local template
+ *
+ * Image:
+ *   1. Gemini 3.1 Flash Image
+ *   2. Pexels
+ *
+ * Pollinations is NOT used anywhere.
  */
 
 function required(name: string): string {
   const value = process.env[name];
+
   if (!value) {
     throw new Error(
-      `Missing required environment variable: ${name}. Check .env.local (see .env.example).`
+      `Missing required environment variable: ${name}. Check .env.local or Vercel Environment Variables.`
     );
   }
+
   return value;
 }
 
@@ -19,72 +32,115 @@ function optional(name: string, fallback = ""): string {
 }
 
 export const env = {
-  // Supabase
+  // =========================================================
+  // SUPABASE
+  // =========================================================
+
   get supabaseUrl() {
     return required("NEXT_PUBLIC_SUPABASE_URL");
   },
+
   get supabaseServiceRoleKey() {
     return required("SUPABASE_SERVICE_ROLE_KEY");
   },
 
-  // Single-user admin auth
+  // =========================================================
+  // ADMIN AUTH
+  // =========================================================
+
   get adminPassword() {
     return required("ADMIN_PASSWORD");
   },
+
   get sessionSecret() {
     return required("SESSION_SECRET");
   },
 
-  // Meta (Facebook) app. These are optional because the credentials are
-  // normally entered in Settings and stored in the database — see
-  // lib/facebook/credentials.ts — so that installing this app does not require
-  // editing environment variables.
+  // =========================================================
+  // FACEBOOK / META
+  // =========================================================
+
   get facebookAppIdOptional() {
     return optional("FACEBOOK_APP_ID");
   },
+
   get facebookAppSecretOptional() {
     return optional("FACEBOOK_APP_SECRET");
   },
+
   get facebookConfigIdOptional() {
     return optional("FACEBOOK_CONFIG_ID");
   },
-  /** Only set this to pin a redirect URI that differs from the request origin. */
+
+  /**
+   * Optional override for Facebook OAuth redirect URI.
+   */
   get facebookRedirectUriOverride() {
     return optional("FACEBOOK_REDIRECT_URI");
   },
 
-  // Free-tier LLM keys. Both are optional: without either one the app falls
-  // back to the keyless Pollinations endpoint, and then to template copy.
+  // =========================================================
+  // AI PROVIDERS
+  // =========================================================
+
+  /**
+   * Primary text-generation provider.
+   */
   get groqApiKey() {
     return optional("GROQ_API_KEY");
   },
+
+  /**
+   * Text fallback + Gemini image generation.
+   */
   get geminiApiKey() {
     return optional("GEMINI_API_KEY");
   },
 
-  // Free image sources
+  /**
+   * Stock image provider / fallback.
+   */
   get pexelsApiKey() {
     return optional("PEXELS_API_KEY");
   },
 
-  // Cron
+  // =========================================================
+  // CRON
+  // =========================================================
+
   get cronSecret() {
     return optional("CRON_SECRET");
   },
 
+  // =========================================================
+  // SITE URL
+  // =========================================================
+
   /**
-   * Origin this deployment is reachable at, used to build redirects back into
-   * the dashboard. Vercel injects VERCEL_PROJECT_PRODUCTION_URL on every
-   * deployment, so a fresh copy of this app redirects correctly without anyone
-   * having to set NEXT_PUBLIC_SITE_URL by hand.
+   * Origin this deployment is reachable at.
+   *
+   * Priority:
+   * 1. NEXT_PUBLIC_SITE_URL
+   * 2. VERCEL_PROJECT_PRODUCTION_URL
+   * 3. VERCEL_URL
+   * 4. localhost
    */
   get siteUrl() {
     const explicit = optional("NEXT_PUBLIC_SITE_URL");
-    if (explicit) return explicit;
 
-    const vercelHost = optional("VERCEL_PROJECT_PRODUCTION_URL") || optional("VERCEL_URL");
-    if (vercelHost) return `https://${vercelHost}`;
+    if (explicit) {
+      return explicit;
+    }
+
+    const vercelHost =
+      optional("VERCEL_PROJECT_PRODUCTION_URL") ||
+      optional("VERCEL_URL");
+
+    if (vercelHost) {
+      return `https://${vercelHost}`;
+    }
 
     return "http://localhost:3000";
   },
 };
+

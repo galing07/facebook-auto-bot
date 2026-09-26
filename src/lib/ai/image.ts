@@ -60,7 +60,7 @@ const PHOTO_STYLE = [
   "no grid",
 ].join(", ");
 
-// CHANGED: Prompt ini sekarang meminta Gemini untuk TIDAK membuat teks sama sekali
+// PERBAIKAN: Prompt ini meminta Gemini untuk TIDAK membuat teks sama sekali
 function buildGeminiPrompt(
   prompt: string,
   title?: string
@@ -619,11 +619,6 @@ function wrapHeadline(
     lines.push(current);
   }
 
-  /*
-   * Keep the overlay compact.
-   * If there are more than 3 lines,
-   * merge the remaining words into line 3.
-   */
   if (lines.length > 3) {
     const first =
       lines[0];
@@ -650,15 +645,19 @@ function wrapHeadline(
 // HEADLINE SVG
 // ============================================================
 
-// CHANGED: Fungsi ini dirombak total agar tidak ada kotak hitam transparan,
-// dan menggunakan teks putih besar dengan garis tepi (stroke) hitam tebal.
+// PERBAIKAN: Fungsi ini dirombak total agar tidak ada kotak hitam transparan,
+// menghapus emoji otomatis, dan menggunakan teks putih besar dengan stroke hitam tebal.
 function createHeadlineSvg(
   title: string
 ): Buffer {
-  const cleanTitle = title.trim().replace(/\s+/g, " ");
+  // 1. Hapus Emoji dan karakter non-ASCII agar Sharp tidak error
+  const cleanTitle = title
+    .trim()
+    .replace(/[^\x00-\x7F]/g, "") // Menghapus emoji & karakter aneh
+    .replace(/\s+/g, " ");
 
   if (!cleanTitle) {
-    throw new Error("Headline title is empty");
+    throw new Error("Headline title is empty after removing emojis");
   }
 
   const lines = wrapHeadline(cleanTitle, 22);
@@ -667,12 +666,11 @@ function createHeadlineSvg(
     throw new Error("Unable to create headline overlay");
   }
 
-  // Ukuran font yang lebih besar untuk visibilitas mobile
+  // Ukuran font dinamis
   const fontSize = lines.length === 1 ? 96 : lines.length === 2 ? 82 : 68;
   const lineHeight = fontSize + 16;
 
-  // POSISI TEKS:
-  // Teks di bawah (seperti contoh gambar 2). 
+  // Posisi teks (bisa diubah ke atas atau bawah)
   // Jika ingin di atas (seperti gambar 3 & 4), ubah baris ini menjadi: const textStartY = 150;
   const textStartY = FINAL_HEIGHT - (lines.length * lineHeight) - 60;
 
@@ -683,6 +681,7 @@ function createHeadlineSvg(
       )}</tspan>`
   );
 
+  // 2. Gunakan font generic 'sans-serif' yang pasti ada di server
   const svg = `
 <svg
   width="${FINAL_WIDTH}"
@@ -691,7 +690,6 @@ function createHeadlineSvg(
   xmlns="http://www.w3.org/2000/svg"
 >
   <defs>
-    <!-- Bayangan tebal agar kontras dengan background -->
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
       <feDropShadow dx="0" dy="8" stdDeviation="6" flood-color="#000000" flood-opacity="0.8" />
     </filter>
@@ -701,7 +699,7 @@ function createHeadlineSvg(
     x="540"
     y="${textStartY}"
     text-anchor="middle"
-    font-family="Arial, Helvetica, sans-serif"
+    font-family="sans-serif"
     font-size="${fontSize}px"
     font-weight="900"
     fill="#ffffff"
@@ -730,9 +728,9 @@ async function applyHeadlineOverlay(
   const cleanTitle =
     title?.trim() || "";
 
-  /*
-   * If no title is supplied, preserve the original image.
-   */
+  // PERBAIKAN: Tambahkan log untuk debugging
+  console.log(`[DEBUG] Menerima title untuk overlay: "${cleanTitle}"`);
+
   if (!cleanTitle) {
     console.warn(
       "[IMAGE] No headline supplied; skipping text overlay."
@@ -844,12 +842,6 @@ export async function generateImage(
           cleanTitle
         );
 
-      /*
-       * IMPORTANT:
-       * Always apply the title AFTER Gemini generation.
-       * This guarantees the text exists even when Gemini
-       * failed to render it itself.
-       */
       const finalBlob =
         await applyHeadlineOverlay(
           baseBlob,
@@ -876,10 +868,6 @@ export async function generateImage(
             cleanPrompt
           );
 
-        /*
-         * Pexels does not create text.
-         * Sharp adds the headline here.
-         */
         const finalBlob =
           await applyHeadlineOverlay(
             baseBlob,
@@ -918,10 +906,6 @@ export async function generateImage(
         cleanPrompt
       );
 
-    /*
-     * IMPORTANT:
-     * Pexels image also receives the same headline overlay.
-     */
     const finalBlob =
       await applyHeadlineOverlay(
         baseBlob,
@@ -949,9 +933,6 @@ export async function generateImage(
           cleanTitle
         );
 
-      /*
-       * Gemini fallback also receives programmatic overlay.
-       */
       const finalBlob =
         await applyHeadlineOverlay(
           baseBlob,
@@ -993,10 +974,6 @@ async function upload(
   const db =
     supabaseAdmin();
 
-  /*
-   * applyHeadlineOverlay() outputs JPEG,
-   * but this also safely handles other image types.
-   */
   let extension =
     "jpg";
 

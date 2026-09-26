@@ -1,38 +1,125 @@
 import { randomUUID } from "crypto";
+
 import { env } from "@/lib/env";
 import { supabaseAdmin } from "@/lib/supabase/server";
-import type { ImageSource, ImageSourcePref } from "@/lib/types";
+
+import type {
+  ImageSource,
+  ImageSourcePref,
+} from "@/lib/types";
 
 const STORAGE_BUCKET = "post-images";
 
-const WIDTH = 1200;
-const HEIGHT = 1200;
+const GEMINI_IMAGE_MODEL =
+  "gemini-3.1-flash-image";
 
-/**
- * AI = Gemini image generation
- * STOCK = Pexels
- *
- * mixed = randomly selects Gemini or Pexels.
- */
-export function resolveImageSource(pref: ImageSourcePref): ImageSource {
+const GEMINI_IMAGE_ENDPOINT =
+  "https://generativelanguage.googleapis.com/v1beta/interactions";
+
+const GEMINI_TIMEOUT_MS = 90_000;
+
+const PEXELS_TIMEOUT_MS = 20_000;
+
+// ============================================================
+// SOURCE RESOLUTION
+// ============================================================
+
+export function resolveImageSource(
+  pref: ImageSourcePref
+): ImageSource {
   if (pref === "mixed") {
-    return Math.random() < 0.5 ? "ai" : "stock";
+    return Math.random() < 0.5
+      ? "ai"
+      : "stock";
   }
 
   return pref;
 }
 
-const PHOTO_STYLE =
-  "single subject, professional photograph, natural light, " +
-  "shallow depth of field, high detail, photorealistic, " +
-  "no text, no watermark, no collage, no grid";
+// ============================================================
+// GEMINI PROMPT
+// ============================================================
+
+const PHOTO_STYLE = [
+  "photorealistic",
+  "professional photography",
+  "natural lighting",
+  "realistic details",
+  "high detail",
+  "clean composition",
+  "single scene",
+  "single image",
+  "no text",
+  "no watermark",
+  "no logo",
+  "no collage",
+  "no grid",
+].join(", ");
+
+function buildGeminiPrompt(
+  prompt: string
+): string {
+  return [
+    "Create a high-quality square social media photograph.",
+    `Subject: ${prompt.trim()}`,
+    PHOTO_STYLE,
+  ].join("\n");
+}
+
+// ============================================================
+// PEXELS SEARCH QUERY
+// ============================================================
 
 /**
- * Generate an image using Gemini 3.1 Flash Image.
+ * Pexels should NOT receive the entire AI prompt.
  *
- * IMPORTANT:
- * Pollinations is intentionally NOT used.
+ * Convert:
+ *
+ * "Create a photorealistic professional..."
+ *
+ * into a short search query:
+ *
+ * "wedding couple beach"
  */
+function buildPexelsQuery(
+  prompt: string
+): string {
+  let query = prompt
+    .replace(
+      /create|generate|image|photo|photograph|photorealistic|professional|high quality/gi,
+      " "
+    )
+    .replace(
+      /social media|square|natural lighting|realistic|high detail|clean composition/gi,
+      " "
+    )
+    .replace(
+      /no text|no watermark|no logo|no collage|no grid/gi,
+      " "
+    )
+    .replace(
+      /[^a-zA-Z0-9À-ÿ\s-]/g,
+      " "
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const words = query
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 8);
+
+  if (words.length === 0) {
+    return "lifestyle";
+  }
+
+  return words.join(" ");
+}
+
+// ============================================================
+// GEMINI IMAGE GENERATION
+// ============================================================
+
 async function fetchGeminiImageBytes(
   prompt: string
 ): Promise<Blob> {
@@ -45,200 +132,391 @@ async function fetchGeminiImageBytes(
   }
 
   const finalPrompt =
-    `${prompt}. ${PHOTO_STYLE}. ` +
-    "Create a single square social-media photograph.";
+    buildGeminiPrompt(prompt);
+
+  console.info(
+    `[IMAGE] Gemini starting model=${GEMINI_IMAGE_MODEL}`
+  );
+
+  const requestBody = {
+    model: GEMINI_IMAGE_MODEL,
+
+    /*
+     * Use the documented Interactions input format.
+     */
+    input: [
+      {
+        type: "text",
+        text: finalPrompt,
+      },
+    ],
+
+    /*
+     * Request image output.
+     */
+    response_format: {
+      type: "image",
+      mime_type: "image/jpeg",
+      aspect_ratio: "1:1",
+      image_size: "1K",
+    },
+  };
 
   const response = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/interactions",
+    GEMINI_IMAGE_ENDPOINT,
     {
       method: "POST",
+
       headers: {
         "Content-Type": "application/json",
         "x-goog-api-key": apiKey,
       },
-      body: JSON.stringify({
-        model: "gemini-3.1-flash-image",
-        input: finalPrompt,
-        response_format: {
-          type: "image",
-          mime_type: "image/jpeg",
-          aspect_ratio: "1:1",
-          image_size: "1K",
-        },
-      }),
-      signal: AbortSignal.timeout(60_000),
+
+      body: JSON.stringify(
+        requestBody
+      ),
+
+      signal:
+        AbortSignal.timeout(
+          GEMINI_TIMEOUT_MS
+        ),
     }
   );
 
-  const body = await response.text();
+  const body =
+    await response.text();
+
+  console.info(
+    `[IMAGE] Gemini HTTP ${response.status}`
+  );
 
   if (!response.ok) {
+    console.error(
+      "[IMAGE] Gemini API error:",
+      body.slice(0, 1500)
+    );
+
     throw new Error(
-      `Gemini image API ${response.status}: ${body.slice(0, 500)}`
+      `Gemini image API HTTP ${response.status}: ${body.slice(
+        0,
+        500
+      )}`
     );
   }
 
-  const data = JSON.parse(body);
+  let data: any;
 
-  /**
-   * Current Gemini Interactions API returns the generated image
-   * in output_image.data.
-   */
-  const base64 =
-    data?.output_image?.data;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    console.error(
+      "[IMAGE] Gemini returned non-JSON:",
+      body.slice(0, 1000)
+    );
+
+    throw new Error(
+      "Gemini returned invalid JSON"
+    );
+  }
+
+  // ==========================================================
+  // PRIMARY: output_image.data
+  // ==========================================================
+
+  const outputImage =
+    data?.output_image;
 
   if (
-    typeof base64 !== "string" ||
-    !base64.trim()
+    outputImage &&
+    typeof outputImage.data === "string" &&
+    outputImage.data.length > 0
   ) {
-    /**
-     * Defensive fallback for responses that expose the image
-     * inside interaction steps.
-     */
-    const steps = Array.isArray(data?.steps)
+    const mimeType =
+      typeof outputImage.mime_type === "string"
+        ? outputImage.mime_type
+        : "image/jpeg";
+
+    const bytes =
+      Buffer.from(
+        outputImage.data,
+        "base64"
+      );
+
+    if (bytes.length === 0) {
+      throw new Error(
+        "Gemini returned empty image data"
+      );
+    }
+
+    console.info(
+      `[IMAGE] Gemini SUCCESS output_image bytes=${bytes.length}`
+    );
+
+    return new Blob(
+      [bytes],
+      {
+        type: mimeType,
+      }
+    );
+  }
+
+  // ==========================================================
+  // SECONDARY: steps[].content[]
+  // ==========================================================
+
+  const steps =
+    Array.isArray(data?.steps)
       ? data.steps
       : [];
 
-    for (const step of steps) {
-      const content = Array.isArray(step?.content)
+  for (const step of steps) {
+    const content =
+      Array.isArray(step?.content)
         ? step.content
         : [];
 
-      for (const item of content) {
-        if (
-          item?.type === "image" &&
-          typeof item?.data === "string"
-        ) {
-          const bytes = Buffer.from(
+    for (const item of content) {
+      if (
+        item?.type === "image" &&
+        typeof item?.data === "string" &&
+        item.data.length > 0
+      ) {
+        const mimeType =
+          typeof item.mime_type === "string"
+            ? item.mime_type
+            : "image/jpeg";
+
+        const bytes =
+          Buffer.from(
             item.data,
             "base64"
           );
 
-          return new Blob(
-            [bytes],
-            {
-              type:
-                item.mime_type ||
-                "image/jpeg",
-            }
-          );
+        if (bytes.length === 0) {
+          continue;
         }
+
+        console.info(
+          `[IMAGE] Gemini SUCCESS steps image bytes=${bytes.length}`
+        );
+
+        return new Blob(
+          [bytes],
+          {
+            type: mimeType,
+          }
+        );
       }
     }
-
-    throw new Error(
-      "Gemini image API returned no image data"
-    );
   }
 
-  const bytes = Buffer.from(
-    base64,
-    "base64"
+  // ==========================================================
+  // NO IMAGE
+  // ==========================================================
+
+  console.error(
+    "[IMAGE] Gemini response contained no image."
   );
 
-  return new Blob(
-    [bytes],
-    {
-      type:
-        data?.output_image?.mime_type ||
-        "image/jpeg",
-    }
+  console.error(
+    "[IMAGE] Gemini response keys:",
+    Object.keys(data ?? {})
+  );
+
+  throw new Error(
+    "Gemini completed but returned no image data"
   );
 }
 
-/**
- * Pexels stock-image fallback.
- */
+// ============================================================
+// PEXELS
+// ============================================================
+
 async function fetchStockImageBytes(
-  query: string
+  prompt: string
 ): Promise<Blob> {
-  if (!env.pexelsApiKey) {
+  const apiKey =
+    env.pexelsApiKey;
+
+  if (!apiKey) {
     throw new Error(
       "PEXELS_API_KEY is not configured"
     );
   }
 
-  const searchUrl =
-    `https://api.pexels.com/v1/search?` +
-    new URLSearchParams({
-      query,
-      orientation: "square",
-      per_page: "10",
-    });
+  const query =
+    buildPexelsQuery(prompt);
 
-  const searchRes = await fetch(
-    searchUrl,
-    {
-      headers: {
-        Authorization: env.pexelsApiKey,
-      },
-      signal: AbortSignal.timeout(15_000),
-    }
+  console.info(
+    `[IMAGE] Pexels query="${query}"`
   );
 
-  if (!searchRes.ok) {
+  const searchUrl =
+    new URL(
+      "https://api.pexels.com/v1/search"
+    );
+
+  searchUrl.searchParams.set(
+    "query",
+    query
+  );
+
+  searchUrl.searchParams.set(
+    "orientation",
+    "square"
+  );
+
+  searchUrl.searchParams.set(
+    "size",
+    "large"
+  );
+
+  searchUrl.searchParams.set(
+    "per_page",
+    "15"
+  );
+
+  const response =
+    await fetch(
+      searchUrl.toString(),
+      {
+        method: "GET",
+
+        headers: {
+          Authorization: apiKey,
+        },
+
+        signal:
+          AbortSignal.timeout(
+            PEXELS_TIMEOUT_MS
+          ),
+      }
+    );
+
+  const body =
+    await response.text();
+
+  console.info(
+    `[IMAGE] Pexels HTTP ${response.status}`
+  );
+
+  if (!response.ok) {
+    console.error(
+      "[IMAGE] Pexels API error:",
+      body.slice(0, 1000)
+    );
+
     throw new Error(
-      `Pexels search failed (${searchRes.status})`
+      `Pexels HTTP ${response.status}: ${body.slice(
+        0,
+        500
+      )}`
     );
   }
 
-  const data = await searchRes.json();
+  let data: any;
 
-  const photos: Array<{
-    src: {
-      large2x?: string;
-      large: string;
-    };
-  }> = data.photos ?? [];
+  try {
+    data =
+      JSON.parse(body);
+  } catch {
+    throw new Error(
+      "Pexels returned invalid JSON"
+    );
+  }
+
+  const photos =
+    Array.isArray(data?.photos)
+      ? data.photos
+      : [];
 
   if (photos.length === 0) {
     throw new Error(
-      "No stock photos found for this topic"
+      `Pexels returned no photos for query "${query}"`
     );
   }
 
-  const chosen =
-    photos[
+  const validPhotos =
+    photos.filter(
+      (photo: any) =>
+        typeof photo?.src?.large2x ===
+          "string" ||
+        typeof photo?.src?.large ===
+          "string"
+    );
+
+  if (
+    validPhotos.length === 0
+  ) {
+    throw new Error(
+      "Pexels returned photos without usable URLs"
+    );
+  }
+
+  const selected =
+    validPhotos[
       Math.floor(
-        Math.random() * photos.length
+        Math.random() *
+          validPhotos.length
       )
     ];
 
   const imageUrl =
-    chosen.src.large2x ??
-    chosen.src.large;
+    selected.src.large2x ??
+    selected.src.large;
 
-  const imageRes = await fetch(
-    imageUrl,
-    {
-      signal: AbortSignal.timeout(20_000),
-    }
+  console.info(
+    `[IMAGE] Pexels downloading selected photo`
   );
 
-  if (!imageRes.ok) {
+  const imageResponse =
+    await fetch(
+      imageUrl,
+      {
+        method: "GET",
+
+        signal:
+          AbortSignal.timeout(
+            PEXELS_TIMEOUT_MS
+          ),
+      }
+    );
+
+  if (!imageResponse.ok) {
     throw new Error(
-      "Failed to download chosen stock photo"
+      `Pexels image download HTTP ${imageResponse.status}`
     );
   }
 
-  return imageRes.blob();
+  const blob =
+    await imageResponse.blob();
+
+  if (
+    !blob.type ||
+    !blob.type.startsWith("image/")
+  ) {
+    throw new Error(
+      `Pexels returned invalid content type: ${blob.type}`
+    );
+  }
+
+  if (blob.size === 0) {
+    throw new Error(
+      "Pexels returned an empty image"
+    );
+  }
+
+  console.info(
+    `[IMAGE] Pexels SUCCESS size=${blob.size} type=${blob.type}`
+  );
+
+  return blob;
 }
 
-/**
- * Generate or source an image and upload it to Supabase Storage.
- *
- * Priority:
- *
- * AI:
- *   Gemini
- *     ↓ failure
- *   Pexels
- *
- * STOCK:
- *   Pexels
- *     ↓ failure
- *   Gemini
- */
+// ============================================================
+// PUBLIC GENERATOR
+// ============================================================
+
 export async function generateImage(
   prompt: string,
   pref: ImageSourcePref
@@ -246,65 +524,130 @@ export async function generateImage(
   url: string;
   source: ImageSource;
 }> {
+  const cleanPrompt =
+    prompt.trim();
+
+  if (!cleanPrompt) {
+    throw new Error(
+      "Image prompt is required"
+    );
+  }
+
   const source =
     resolveImageSource(pref);
 
-  let blob: Blob;
+  console.info(
+    `[IMAGE] requested source=${source}`
+  );
 
-  try {
-    blob =
-      source === "ai"
-        ? await fetchGeminiImageBytes(prompt)
-        : await fetchStockImageBytes(prompt);
-  } catch (err) {
-    console.error(
-      `[generateImage] ${source} provider failed:`,
-      err instanceof Error
-        ? err.message
-        : String(err)
-    );
+  // ==========================================================
+  // AI SOURCE
+  // Gemini -> Pexels
+  // ==========================================================
 
-    /**
-     * Fallback:
-     *
-     * Gemini -> Pexels
-     * Pexels -> Gemini
-     */
-    const fallbackSource: ImageSource =
-      source === "ai"
-        ? "stock"
-        : "ai";
-
+  if (source === "ai") {
     try {
-      blob =
-        fallbackSource === "ai"
-          ? await fetchGeminiImageBytes(prompt)
-          : await fetchStockImageBytes(prompt);
+      const blob =
+        await fetchGeminiImageBytes(
+          cleanPrompt
+        );
 
-      return await upload(
+      return upload(
         blob,
-        fallbackSource
+        "ai"
       );
-    } catch (fallbackErr) {
+    } catch (geminiError) {
+      const message =
+        geminiError instanceof Error
+          ? geminiError.message
+          : String(geminiError);
+
       console.error(
-        `[generateImage] fallback ${fallbackSource} failed:`,
-        fallbackErr instanceof Error
-          ? fallbackErr.message
-          : String(fallbackErr)
+        `[IMAGE] Gemini FAILED: ${message}`
       );
 
-      throw new Error(
-        `Image generation failed. Primary provider: ${source}. ` +
-          `Fallback provider: ${fallbackSource}.`
-      );
+      try {
+        const blob =
+          await fetchStockImageBytes(
+            cleanPrompt
+          );
+
+        return upload(
+          blob,
+          "stock"
+        );
+      } catch (pexelsError) {
+        const message2 =
+          pexelsError instanceof Error
+            ? pexelsError.message
+            : String(pexelsError);
+
+        console.error(
+          `[IMAGE] Pexels FALLBACK FAILED: ${message2}`
+        );
+
+        throw new Error(
+          `Image generation failed. Gemini: ${message}. Pexels: ${message2}`
+        );
+      }
     }
   }
 
-  return upload(
-    blob,
-    source
-  );
+  // ==========================================================
+  // STOCK SOURCE
+  // Pexels -> Gemini
+  // ==========================================================
+
+  try {
+    const blob =
+      await fetchStockImageBytes(
+        cleanPrompt
+      );
+
+    return upload(
+      blob,
+      "stock"
+    );
+  } catch (pexelsError) {
+    const message =
+      pexelsError instanceof Error
+        ? pexelsError.message
+        : String(pexelsError);
+
+    console.error(
+      `[IMAGE] Pexels FAILED: ${message}`
+    );
+
+    try {
+      const blob =
+        await fetchGeminiImageBytes(
+          cleanPrompt
+        );
+
+      return upload(
+        blob,
+        "ai"
+      );
+    } catch (geminiError) {
+      const message2 =
+        geminiError instanceof Error
+          ? geminiError.message
+          : String(geminiError);
+
+      console.error(
+        `[IMAGE] Gemini FALLBACK FAILED: ${message2}`
+      );
+
+      throw new Error(
+        `Image generation failed. Pexels: ${message}. Gemini: ${message2}`
+      );
+    }
+  }
 }
+
+// ============================================================
+// SUPABASE STORAGE
+// ============================================================
 
 async function upload(
   blob: Blob,
@@ -316,49 +659,85 @@ async function upload(
   const db =
     supabaseAdmin();
 
-  const extension =
-    blob.type === "image/png"
-      ? "png"
-      : "jpg";
+  let extension = "jpg";
+
+  if (
+    blob.type ===
+    "image/png"
+  ) {
+    extension = "png";
+  } else if (
+    blob.type ===
+    "image/webp"
+  ) {
+    extension = "webp";
+  }
+
+  const date =
+    new Date()
+      .toISOString()
+      .slice(0, 10);
 
   const path =
-    `${new Date().toISOString().slice(0, 10)}/` +
-    `${randomUUID()}.${extension}`;
+    `${date}/${randomUUID()}.${extension}`;
 
   const bytes =
     new Uint8Array(
       await blob.arrayBuffer()
     );
 
+  console.info(
+    `[IMAGE] Supabase upload source=${source} path=${path} size=${bytes.length}`
+  );
+
   const {
     error,
-  } = await db.storage
-    .from(STORAGE_BUCKET)
-    .upload(
-      path,
-      bytes,
-      {
-        contentType:
-          blob.type ||
-          "image/jpeg",
-        upsert: false,
-      }
-    );
+  } =
+    await db.storage
+      .from(STORAGE_BUCKET)
+      .upload(
+        path,
+        bytes,
+        {
+          contentType:
+            blob.type ||
+            "image/jpeg",
+
+          upsert: false,
+        }
+      );
 
   if (error) {
     throw new Error(
-      `Storage upload failed: ${error.message}`
+      `Supabase Storage upload failed: ${error.message}`
     );
   }
 
   const {
     data,
-  } = db.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(path);
+  } =
+    db.storage
+      .from(STORAGE_BUCKET)
+      .getPublicUrl(
+        path
+      );
+
+  if (
+    !data?.publicUrl
+  ) {
+    throw new Error(
+      "Supabase did not return public image URL"
+    );
+  }
+
+  console.info(
+    `[IMAGE] Supabase upload SUCCESS source=${source}`
+  );
 
   return {
-    url: data.publicUrl,
+    url:
+      data.publicUrl,
+
     source,
   };
 }

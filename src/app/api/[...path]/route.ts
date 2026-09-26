@@ -628,58 +628,105 @@ async function handlePost(
     }
   }
 
-  // ----------------------------------------------------------
+    // ----------------------------------------------------------
   // GENERATE IMAGE
   //
   // IMPORTANT:
-  // title is forwarded to generateImage() so the AI image
-  // generator knows the exact Facebook headline that must
-  // appear inside the generated image.
+  // title is REQUIRED.
+  //
+  // The image generator must receive the exact Facebook
+  // headline because the final image must contain that
+  // headline visually.
   // ----------------------------------------------------------
 
   if (
     route ===
     "generate/image"
   ) {
+    const body =
+      await req
+        .json()
+        .catch(() => null);
+
+    console.info(
+      "[API] RAW IMAGE REQUEST:",
+      JSON.stringify(body)
+    );
+
     const parsed =
-      ImageBody.safeParse(
-        await req
-          .json()
-          .catch(() => null)
-      );
+      ImageBody.safeParse(body);
 
     if (!parsed.success) {
+      console.error(
+        "[API] IMAGE REQUEST VALIDATION FAILED:",
+        parsed.error.flatten()
+      );
+
       return json(
         {
           error:
-            "An image prompt and image source are required.",
+            "Image prompt, headline title, and image source are required.",
+
+          details:
+            parsed.error.flatten(),
+        },
+        400
+      );
+    }
+
+    const {
+      prompt,
+      title,
+      source,
+    } = parsed.data;
+
+    console.info(
+      "[API] IMAGE REQUEST:",
+      {
+        title,
+        source,
+        promptLength:
+          prompt.length,
+      }
+    );
+
+    /*
+     * NEVER allow an empty headline to reach the image
+     * generator.
+     */
+    if (!title.trim()) {
+      console.error(
+        "[API] IMAGE REQUEST REJECTED: EMPTY TITLE"
+      );
+
+      return json(
+        {
+          error:
+            "Image headline/title cannot be empty.",
         },
         400
       );
     }
 
     try {
-      console.info(
-        "[API] Image generation request:",
-        {
-          source:
-            parsed.data.source,
-
-          title:
-            parsed.data.title ??
-            "(no title)",
-
-          promptLength:
-            parsed.data.prompt.length,
-        }
-      );
-
       const result =
         await generateImage(
-          parsed.data.prompt,
-          parsed.data.source,
-          parsed.data.title
+          prompt,
+          source,
+          title
         );
+
+      console.info(
+        "[API] IMAGE GENERATION SUCCESS:",
+        {
+          title,
+          source,
+          imageUrl:
+            result?.imageUrl ?? null,
+          imageSource:
+            result?.imageSource ?? null,
+        }
+      );
 
       return json(result);
     } catch (err) {

@@ -799,7 +799,7 @@ async function applyHeadlineOverlay(
 export async function generateImage(
   prompt: string,
   pref: ImageSourcePref,
-  title?: string
+  title: string
 ): Promise<{
   url: string;
   source: ImageSource;

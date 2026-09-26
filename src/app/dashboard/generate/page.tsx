@@ -18,7 +18,12 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { facebookPostUrl } from "@/lib/types";
-import type { GeneratedContent, ImageSource, ImageSourcePref, PageCache } from "@/lib/types";
+import type {
+  GeneratedContent,
+  ImageSource,
+  ImageSourcePref,
+  PageCache,
+} from "@/lib/types";
 
 type Step = "idle" | "generating" | "ready";
 
@@ -26,37 +31,54 @@ export default function GeneratePage() {
   const [topic, setTopic] = useState("");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [ownTopics, setOwnTopics] = useState<string[]>([]);
-  const [imagePref, setImagePref] = useState<ImageSourcePref>("ai");
+  const [imagePref, setImagePref] =
+    useState<ImageSourcePref>("ai");
 
   const [step, setStep] = useState<Step>("idle");
   const [error, setError] = useState<string | null>(null);
 
-  const [content, setContent] = useState<GeneratedContent | null>(null);
-  const [image, setImage] = useState<{ url: string; source: ImageSource } | null>(null);
+  const [content, setContent] =
+    useState<GeneratedContent | null>(null);
+
+  const [image, setImage] = useState<{
+    url: string;
+    source: ImageSource;
+  } | null>(null);
+
   const [hashtagInput, setHashtagInput] = useState("");
   const [linkUrl, setLinkUrl] = useState("");
 
   const [pages, setPages] = useState<PageCache[]>([]);
   const [pageId, setPageId] = useState("");
+
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scheduledAt, setScheduledAt] = useState("");
-  const [saving, setSaving] = useState<"draft" | "schedule" | "post_now" | null>(null);
+
+  const [saving, setSaving] = useState<
+    "draft" | "schedule" | "post_now" | null
+  >(null);
+
   const [success, setSuccess] = useState<string | null>(null);
-  const [publishedUrl, setPublishedUrl] = useState<string | null>(null);
+  const [publishedUrl, setPublishedUrl] =
+    useState<string | null>(null);
 
   useEffect(() => {
-    // Arriving from the Topics screen's "write now" link. Read directly rather
-    // than through useSearchParams, which would force a Suspense boundary
-    // around the whole form for one optional value.
-    const fromLink = new URLSearchParams(window.location.search).get("topic");
-    if (fromLink) setTopic(fromLink);
+    const fromLink = new URLSearchParams(
+      window.location.search
+    ).get("topic");
+
+    if (fromLink) {
+      setTopic(fromLink);
+    }
 
     fetch("/api/topics")
       .then((r) => r.json())
       .then((d) =>
         setOwnTopics(
           (d.topics ?? [])
-            .filter((t: { enabled: boolean }) => t.enabled)
+            .filter(
+              (t: { enabled: boolean }) => t.enabled
+            )
             .map((t: { text: string }) => t.text)
         )
       )
@@ -64,30 +86,46 @@ export default function GeneratePage() {
 
     fetch("/api/trends")
       .then((r) => r.json())
-      .then((d) => setSuggestions(d.topics ?? []))
+      .then((d) =>
+        setSuggestions(d.topics ?? [])
+      )
       .catch(() => {});
 
     fetch("/api/settings")
       .then((r) => r.json())
-      .then((d) => setImagePref(d.image_source ?? "ai"))
+      .then((d) =>
+        setImagePref(d.image_source ?? "ai")
+      )
       .catch(() => {});
 
     fetch("/api/facebook/pages")
       .then((r) => r.json())
       .then((d) => {
         setPages(d.pages ?? []);
-        if (d.defaultPageId) setPageId(d.defaultPageId);
+
+        if (d.defaultPageId) {
+          setPageId(d.defaultPageId);
+        }
       })
       .catch(() => {});
   }, []);
 
-  const selectedPage = useMemo(() => pages.find((p) => p.page_id === pageId), [pages, pageId]);
+  const selectedPage = useMemo(
+    () =>
+      pages.find(
+        (p) => p.page_id === pageId
+      ),
+    [pages, pageId]
+  );
 
   async function generate() {
     if (topic.trim().length < 2) {
-      setError("Enter a topic first — at least a couple of words.");
+      setError(
+        "Enter a topic first — at least a couple of words."
+      );
       return;
     }
+
     setError(null);
     setSuccess(null);
     setPublishedUrl(null);
@@ -96,82 +134,308 @@ export default function GeneratePage() {
     setImage(null);
 
     try {
-      const [contentRes, imageRes] = await Promise.all([
-        fetch("/api/generate/content", {
+      /*
+       * =====================================================
+       * STEP 1
+       * Generate:
+       * - viral Facebook title
+       * - description
+       * - hashtags
+       * - AI image prompt
+       *
+       * IMPORTANT:
+       * The image prompt comes from the AI.
+       * We do NOT send the original topic directly
+       * to the image generator anymore.
+       * =====================================================
+       */
+
+      const contentRes = await fetch(
+        "/api/generate/content",
+        {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ topic }),
-        }),
-        fetch("/api/generate/image", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ prompt: topic, source: imagePref }),
-        }),
-      ]);
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            topic: topic.trim(),
+          }),
+        }
+      );
 
-      if (!contentRes.ok) throw new Error((await contentRes.json()).error ?? "Content generation failed.");
-      if (!imageRes.ok) throw new Error((await imageRes.json()).error ?? "Image generation failed.");
+      const contentJson: unknown =
+        await contentRes.json();
 
-      const contentData: GeneratedContent = await contentRes.json();
-      const imageData: { url: string; source: ImageSource } = await imageRes.json();
+      if (!contentRes.ok) {
+        const message =
+          contentJson &&
+          typeof contentJson === "object" &&
+          "error" in contentJson
+            ? String(
+                (
+                  contentJson as {
+                    error?: unknown;
+                  }
+                ).error ?? "Content generation failed."
+              )
+            : "Content generation failed.";
 
+        throw new Error(message);
+      }
+
+      const contentData =
+        contentJson as GeneratedContent;
+
+      /*
+       * Make sure the AI returned an image prompt.
+       */
+      if (
+        !contentData.imagePrompt ||
+        !contentData.imagePrompt.trim()
+      ) {
+        throw new Error(
+          "AI generated the caption but did not return an image prompt."
+        );
+      }
+
+      /*
+       * Show generated content immediately.
+       */
       setContent(contentData);
+
+      console.info(
+        "[GeneratePage] Content provider:",
+        contentData.provider
+      );
+
+      console.info(
+        "[GeneratePage] AI image prompt:",
+        contentData.imagePrompt
+      );
+
+      /*
+       * =====================================================
+       * STEP 2
+       * Generate image using the AI-generated imagePrompt.
+       * =====================================================
+       */
+
+      const imageRes = await fetch(
+        "/api/generate/image",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            prompt: contentData.imagePrompt,
+            source: imagePref,
+          }),
+        }
+      );
+
+      const imageJson: unknown =
+        await imageRes.json();
+
+      if (!imageRes.ok) {
+        const message =
+          imageJson &&
+          typeof imageJson === "object" &&
+          "error" in imageJson
+            ? String(
+                (
+                  imageJson as {
+                    error?: unknown;
+                  }
+                ).error ?? "Image generation failed."
+              )
+            : "Image generation failed.";
+
+        throw new Error(message);
+      }
+
+      const imageData =
+        imageJson as {
+          url: string;
+          source: ImageSource;
+        };
+
+      if (
+        !imageData.url ||
+        !imageData.source
+      ) {
+        throw new Error(
+          "Image generator returned an invalid response."
+        );
+      }
+
       setImage(imageData);
+
+      console.info(
+        "[GeneratePage] Image source:",
+        imageData.source
+      );
+
+      /*
+       * Generation complete.
+       */
       setStep("ready");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong.");
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Something went wrong.";
+
+      console.error(
+        "[GeneratePage] Generation failed:",
+        message
+      );
+
+      setError(message);
       setStep("idle");
     }
   }
 
   function removeHashtag(tag: string) {
     if (!content) return;
-    setContent({ ...content, hashtags: content.hashtags.filter((h) => h !== tag) });
+
+    setContent({
+      ...content,
+      hashtags: content.hashtags.filter(
+        (h) => h !== tag
+      ),
+    });
   }
 
   function addHashtag() {
-    const tag = hashtagInput.trim().replace(/^#/, "").toLowerCase();
-    if (!tag || !content || content.hashtags.includes(tag)) return;
-    setContent({ ...content, hashtags: [...content.hashtags, tag] });
+    const tag = hashtagInput
+      .trim()
+      .replace(/^#/, "")
+      .toLowerCase();
+
+    if (
+      !tag ||
+      !content ||
+      content.hashtags.includes(tag)
+    ) {
+      return;
+    }
+
+    setContent({
+      ...content,
+      hashtags: [
+        ...content.hashtags,
+        tag,
+      ],
+    });
+
     setHashtagInput("");
   }
 
-  async function save(action: "draft" | "schedule" | "post_now") {
-    if (!content || !image) return;
-    if (action !== "draft" && !pageId) {
-      setError("Choose a Page before scheduling or posting.");
+  async function save(
+    action:
+      | "draft"
+      | "schedule"
+      | "post_now"
+  ) {
+    if (!content || !image) {
       return;
     }
-    if (action === "schedule" && !scheduledAt) {
-      setError("Pick a date and time to schedule this post.");
+
+    if (
+      action !== "draft" &&
+      !pageId
+    ) {
+      setError(
+        "Choose a Page before scheduling or posting."
+      );
+      return;
+    }
+
+    if (
+      action === "schedule" &&
+      !scheduledAt
+    ) {
+      setError(
+        "Pick a date and time to schedule this post."
+      );
       return;
     }
 
     setError(null);
     setSaving(action);
-    try {
-      const res = await fetch("/api/posts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          topic,
-          title: content.title,
-          description: content.description,
-          hashtags: content.hashtags,
-          imageUrl: image.url,
-          imageSource: image.source,
-          linkUrl: linkUrl || undefined,
-          pageId: pageId || selectedPage?.page_id || "unset",
-          pageName: selectedPage?.name ?? "Unset",
-          action,
-          scheduledAt: action === "schedule" ? new Date(scheduledAt).toISOString() : undefined,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Failed to save post.");
 
-      if (action === "post_now" && data.post.status === "failed") {
-        throw new Error(data.post.error_message ?? "Facebook rejected this post.");
+    try {
+      const res = await fetch(
+        "/api/posts",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
+          body: JSON.stringify({
+            topic,
+            title: content.title,
+            description:
+              content.description,
+            hashtags: content.hashtags,
+
+            /*
+             * Keep the AI-generated image prompt
+             * available in the request.
+             *
+             * This is harmless if the API currently
+             * ignores it, and makes it available for
+             * future persistence.
+             */
+            imagePrompt:
+              content.imagePrompt,
+
+            imageUrl: image.url,
+            imageSource: image.source,
+
+            linkUrl:
+              linkUrl || undefined,
+
+            pageId:
+              pageId ||
+              selectedPage?.page_id ||
+              "unset",
+
+            pageName:
+              selectedPage?.name ??
+              "Unset",
+
+            action,
+
+            scheduledAt:
+              action === "schedule"
+                ? new Date(
+                    scheduledAt
+                  ).toISOString()
+                : undefined,
+          }),
+        }
+      );
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(
+          data.error ??
+            "Failed to save post."
+        );
+      }
+
+      if (
+        action === "post_now" &&
+        data.post.status === "failed"
+      ) {
+        throw new Error(
+          data.post.error_message ??
+            "Facebook rejected this post."
+        );
       }
 
       setSuccess(
@@ -181,268 +445,872 @@ export default function GeneratePage() {
             ? "Post scheduled."
             : "Published to Facebook 🎉"
       );
+
       setPublishedUrl(
-        action === "post_now" && data.post.facebook_post_id
-          ? facebookPostUrl(data.post.facebook_post_id)
+        action === "post_now" &&
+        data.post.facebook_post_id
+          ? facebookPostUrl(
+              data.post.facebook_post_id
+            )
           : null
       );
+
       setStep("idle");
       setContent(null);
       setImage(null);
       setTopic("");
       setScheduleOpen(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save post.");
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Failed to save post."
+      );
     } finally {
       setSaving(null);
     }
   }
 
+  /*
+   * =========================================================
+   * UI
+   * =========================================================
+   */
+
   return (
     <div className="mx-auto max-w-5xl space-y-6">
-      <Card>
-        <label className="text-sm font-semibold text-foreground">Topic</label>
-        <p className="mt-1 text-sm text-muted-foreground">
-          What should this post be about? Be specific for better results.
-        </p>
-        <div className="mt-3 flex flex-col gap-3 sm:flex-row">
-          <input
-            value={topic}
-            onChange={(e) => setTopic(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && generate()}
-            placeholder="e.g. cozy fall living room decor ideas"
-            className="flex-1 rounded-xl border border-border bg-background px-3.5 py-2.5 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/30"
-          />
-          <select
-            value={imagePref}
-            onChange={(e) => setImagePref(e.target.value as ImageSourcePref)}
-            className="rounded-xl border border-border bg-background px-3 py-2.5 text-sm outline-none focus:border-primary"
-            aria-label="Image source"
-          >
-            <option value="ai">AI-generated image</option>
-            <option value="stock">Free stock photo</option>
-            <option value="mixed">Mix of both</option>
-          </select>
-          <Button onClick={generate} disabled={step === "generating"}>
-            <Sparkle size={16} weight="fill" />
-            {step === "generating" ? "Generating…" : "Generate"}
-          </Button>
+      {/* HEADER */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <Sparkle
+              size={24}
+              weight="fill"
+            />
+
+            <h1 className="text-2xl font-bold tracking-tight">
+              Generate Post
+            </h1>
+          </div>
+
+          <p className="mt-1 text-sm text-muted-foreground">
+            Turn a topic into a Facebook post,
+            AI image, and publish-ready content.
+          </p>
         </div>
 
-        {ownTopics.length > 0 && (
-          <div className="mt-4 flex flex-wrap gap-2">
-            <span className="mt-1 text-xs font-medium text-muted-foreground">Your topics:</span>
-            {ownTopics.slice(0, 10).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTopic(t)}
-                className="cursor-pointer rounded-full border border-primary/30 bg-primary/5 px-3 py-1 text-xs text-primary transition hover:border-primary"
-              >
-                {t}
-              </button>
-            ))}
-            <Link
-              href="/dashboard/topics"
-              className="mt-0.5 text-xs font-medium text-muted-foreground underline-offset-2 hover:text-primary hover:underline"
-            >
-              Manage
-            </Link>
-          </div>
-        )}
+        <Badge variant="secondary">
+          {step === "generating"
+            ? "Generating..."
+            : step === "ready"
+              ? "Ready"
+              : "Idle"}
+        </Badge>
+      </div>
 
-        {suggestions.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            <span className="mt-1 text-xs font-medium text-muted-foreground">Trending ideas:</span>
-            {suggestions.slice(0, 8).map((s) => (
-              <button
-                key={s}
-                onClick={() => setTopic(s)}
-                className="cursor-pointer rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition hover:border-primary hover:text-primary"
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-        )}
-      </Card>
-
+      {/* ERROR */}
       {error && (
-        <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/10 p-3.5 text-sm text-destructive">
-          <WarningCircle size={18} className="mt-0.5 shrink-0" />
-          {error}
-        </div>
-      )}
-      {success && (
-        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-success/30 bg-success/10 p-3.5 text-sm text-success">
-          <CheckCircle size={18} className="shrink-0" />
-          {success}
-          {publishedUrl && (
-            <a
-              href={publishedUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 font-semibold underline underline-offset-2"
-            >
-              View post <ArrowSquareOut size={13} />
-            </a>
-          )}
-        </div>
-      )}
+        <Card className="border-destructive/50 bg-destructive/5 p-4">
+          <div className="flex items-start gap-3">
+            <WarningCircle
+              size={22}
+              className="mt-0.5 text-destructive"
+            />
 
-      {step === "generating" && (
-        <Card className="animate-pulse">
-          <div className="grid gap-6 md:grid-cols-[320px_1fr]">
-            <div className="aspect-square rounded-xl bg-surface-2" />
-            <div className="space-y-3">
-              <div className="h-6 w-3/4 rounded bg-surface-2" />
-              <div className="h-4 w-full rounded bg-surface-2" />
-              <div className="h-4 w-5/6 rounded bg-surface-2" />
-              <div className="h-4 w-2/3 rounded bg-surface-2" />
+            <div className="flex-1">
+              <p className="font-medium text-destructive">
+                Generation error
+              </p>
+
+              <p className="mt-1 text-sm text-muted-foreground">
+                {error}
+              </p>
             </div>
+
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() =>
+                setError(null)
+              }
+            >
+              <X size={18} />
+            </Button>
           </div>
         </Card>
       )}
 
-      {step === "ready" && content && image && (
-        <Card>
-          <div className="grid gap-6 md:grid-cols-[320px_1fr]">
-            <div>
-              <div className="relative aspect-square overflow-hidden rounded-xl bg-surface-2">
-                <Image src={image.url} alt={content.title} fill unoptimized className="object-cover" />
-              </div>
-              <div className="mt-2 flex items-center justify-between">
-                <Badge>{image.source === "ai" ? "AI generated" : "Stock photo"}</Badge>
-                <button
-                  onClick={generate}
-                  className="flex cursor-pointer items-center gap-1 text-xs font-medium text-muted-foreground hover:text-primary"
+      {/* SUCCESS */}
+      {success && (
+        <Card className="border-green-500/40 bg-green-500/5 p-4">
+          <div className="flex items-start gap-3">
+            <CheckCircle
+              size={22}
+              weight="fill"
+              className="mt-0.5 text-green-600"
+            />
+
+            <div className="flex-1">
+              <p className="font-medium text-green-700 dark:text-green-400">
+                {success}
+              </p>
+
+              {publishedUrl && (
+                <Link
+                  href={publishedUrl}
+                  target="_blank"
+                  className="mt-1 inline-flex items-center gap-1 text-sm underline"
                 >
-                  <ArrowClockwise size={13} /> Regenerate
-                </button>
-              </div>
+                  View Facebook post
+                  <ArrowSquareOut
+                    size={14}
+                  />
+                </Link>
+              )}
             </div>
 
-            <div className="space-y-4">
-              {content.provider === "template" ? (
-                <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-                  Every free AI writer was unreachable, so this copy came from a
-                  template. Edit it before posting, or add a free GROQ_API_KEY or
-                  GEMINI_API_KEY to restore AI copy.
-                </p>
-              ) : content.provider ? (
-                <p className="text-xs text-muted-foreground">
-                  Copy written by <span className="font-medium capitalize">{content.provider}</span>
-                </p>
-              ) : null}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() =>
+                setSuccess(null)
+              }
+            >
+              <X size={18} />
+            </Button>
+          </div>
+        </Card>
+      )}
 
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground">Opening hook</label>
-                <input
-                  value={content.title}
-                  maxLength={120}
-                  onChange={(e) => setContent({ ...content, title: e.target.value })}
-                  className="mt-1 w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-sm font-semibold outline-none focus:border-primary focus:ring-2 focus:ring-primary/30"
+      {/* TOPIC */}
+      <Card className="p-5">
+        <div className="space-y-4">
+          <div>
+            <label
+              htmlFor="topic"
+              className="text-sm font-medium"
+            >
+              Topic
+            </label>
+
+            <textarea
+              id="topic"
+              value={topic}
+              onChange={(e) =>
+                setTopic(e.target.value)
+              }
+              placeholder="Example: 7 hidden places in Indonesia that are still beautiful and quiet"
+              rows={4}
+              className="mt-2 w-full rounded-lg border bg-background px-3 py-3 text-sm outline-none transition focus:ring-2 focus:ring-primary"
+              disabled={
+                step === "generating"
+              }
+            />
+          </div>
+
+          {/* TREND SUGGESTIONS */}
+          {(suggestions.length > 0 ||
+            ownTopics.length > 0) && (
+            <div className="space-y-3">
+              {suggestions.length > 0 && (
+                <div>
+                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Trending topics
+                  </p>
+
+                  <div className="flex flex-wrap gap-2">
+                    {suggestions
+                      .slice(0, 10)
+                      .map((item) => (
+                        <Button
+                          key={item}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            setTopic(item)
+                          }
+                          disabled={
+                            step ===
+                            "generating"
+                          }
+                        >
+                          {item}
+                        </Button>
+                      ))}
+                  </div>
+                </div>
+              )}
+
+              {ownTopics.length > 0 && (
+                <div>
+                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Your topics
+                  </p>
+
+                  <div className="flex flex-wrap gap-2">
+                    {ownTopics
+                      .slice(0, 10)
+                      .map((item) => (
+                        <Button
+                          key={item}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            setTopic(item)
+                          }
+                          disabled={
+                            step ===
+                            "generating"
+                          }
+                        >
+                          {item}
+                        </Button>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* IMAGE SOURCE */}
+          <div>
+            <label className="text-sm font-medium">
+              Image source
+            </label>
+
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              <Button
+                type="button"
+                variant={
+                  imagePref === "ai"
+                    ? "default"
+                    : "outline"
+                }
+                onClick={() =>
+                  setImagePref("ai")
+                }
+                disabled={
+                  step === "generating"
+                }
+              >
+                <Sparkle
+                  size={17}
+                  className="mr-2"
                 />
+                AI Generated
+              </Button>
+
+              <Button
+                type="button"
+                variant={
+                  imagePref === "stock"
+                    ? "default"
+                    : "outline"
+                }
+                onClick={() =>
+                  setImagePref("stock")
+                }
+                disabled={
+                  step === "generating"
+                }
+              >
+                Stock / Pexels
+              </Button>
+
+              <Button
+                type="button"
+                variant={
+                  imagePref === "mixed"
+                    ? "default"
+                    : "outline"
+                }
+                onClick={() =>
+                  setImagePref("mixed")
+                }
+                disabled={
+                  step === "generating"
+                }
+              >
+                Mixed
+              </Button>
+            </div>
+
+            <p className="mt-2 text-xs text-muted-foreground">
+              AI Generated uses the AI-created
+              image prompt from your generated
+              Facebook content.
+            </p>
+          </div>
+
+          {/* GENERATE BUTTON */}
+          <Button
+            type="button"
+            className="w-full"
+            size="lg"
+            onClick={generate}
+            disabled={
+              step === "generating" ||
+              topic.trim().length < 2
+            }
+          >
+            {step === "generating" ? (
+              <>
+                <ArrowClockwise
+                  size={20}
+                  className="mr-2 animate-spin"
+                />
+                AI is creating your post...
+              </>
+            ) : (
+              <>
+                <Sparkle
+                  size={20}
+                  className="mr-2"
+                />
+                Generate Viral Post
+              </>
+            )}
+          </Button>
+        </div>
+      </Card>
+
+      {/* GENERATED RESULT */}
+      {content && (
+        <Card className="overflow-hidden">
+          <div className="border-b p-5">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h2 className="font-semibold">
+                  Generated Content
+                </h2>
+
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Provider:{" "}
+                  {content.provider ??
+                    "template"}
+                </p>
               </div>
 
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground">Description</label>
-                <textarea
-                  value={content.description}
-                  maxLength={500}
-                  rows={3}
-                  onChange={(e) => setContent({ ...content, description: e.target.value })}
-                  className="mt-1 w-full resize-none rounded-xl border border-border bg-background px-3.5 py-2.5 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/30"
-                />
-              </div>
+              <Badge variant="outline">
+                AI Generated
+              </Badge>
+            </div>
+          </div>
 
-              <div>
-                <label className="text-xs font-semibold text-muted-foreground">Hashtags</label>
-                <div className="mt-1.5 flex flex-wrap gap-1.5">
-                  {content.hashtags.map((tag) => (
-                    <span
-                      key={tag}
-                      className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2.5 py-1 text-xs font-medium text-accent"
-                    >
-                      #{tag}
-                      <button onClick={() => removeHashtag(tag)} aria-label={`Remove ${tag}`} className="cursor-pointer">
-                        <X size={11} />
-                      </button>
+          <div className="grid gap-6 p-5 lg:grid-cols-2">
+            {/* IMAGE */}
+            <div>
+              {image ? (
+                <div className="overflow-hidden rounded-xl border bg-muted">
+                  <div className="relative aspect-square">
+                    <Image
+                      src={image.url}
+                      alt={
+                        content.title ||
+                        "Generated Facebook image"
+                      }
+                      fill
+                      unoptimized
+                      className="object-cover"
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between border-t px-3 py-2">
+                    <span className="text-xs text-muted-foreground">
+                      Source:{" "}
+                      {image.source}
                     </span>
-                  ))}
+
+                    <Badge variant="secondary">
+                      {image.source === "ai"
+                        ? "Gemini AI"
+                        : "Pexels"}
+                    </Badge>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex aspect-square items-center justify-center rounded-xl border bg-muted">
+                  <div className="text-center">
+                    <ArrowClockwise
+                      size={28}
+                      className="mx-auto mb-2 animate-spin"
+                    />
+
+                    <p className="text-sm text-muted-foreground">
+                      Creating image...
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* CONTENT */}
+            <div className="space-y-5">
+              <div>
+                <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Title
+                </label>
+
+                <textarea
+                  value={content.title}
+                  onChange={(e) =>
+                    setContent({
+                      ...content,
+                      title: e.target.value,
+                    })
+                  }
+                  rows={3}
+                  className="mt-2 w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary"
+                />
+              </div>
+
+              <div>
+                <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Description
+                </label>
+
+                <textarea
+                  value={
+                    content.description
+                  }
+                  onChange={(e) =>
+                    setContent({
+                      ...content,
+                      description:
+                        e.target.value,
+                    })
+                  }
+                  rows={7}
+                  className="mt-2 w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary"
+                />
+              </div>
+
+              {/* HASHTAGS */}
+              <div>
+                <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Hashtags
+                </label>
+
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {content.hashtags.map(
+                    (tag) => (
+                      <Badge
+                        key={tag}
+                        variant="secondary"
+                        className="gap-1"
+                      >
+                        #{tag}
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            removeHashtag(
+                              tag
+                            )
+                          }
+                          className="ml-1 rounded-full hover:bg-background/50"
+                          aria-label={`Remove ${tag}`}
+                        >
+                          <X size={12} />
+                        </button>
+                      </Badge>
+                    )
+                  )}
+                </div>
+
+                <div className="mt-3 flex gap-2">
                   <input
-                    value={hashtagInput}
-                    onChange={(e) => setHashtagInput(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addHashtag())}
-                    placeholder="add tag…"
-                    className="w-24 rounded-full border border-dashed border-border bg-transparent px-2.5 py-1 text-xs outline-none focus:border-primary"
+                    value={
+                      hashtagInput
+                    }
+                    onChange={(e) =>
+                      setHashtagInput(
+                        e.target.value
+                      )
+                    }
+                    onKeyDown={(e) => {
+                      if (
+                        e.key === "Enter"
+                      ) {
+                        e.preventDefault();
+                        addHashtag();
+                      }
+                    }}
+                    placeholder="Add hashtag"
+                    className="flex-1 rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary"
                   />
+
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={
+                      addHashtag
+                    }
+                  >
+                    Add
+                  </Button>
                 </div>
               </div>
 
+              {/* AI IMAGE PROMPT */}
               <div>
-                <label className="text-xs font-semibold text-muted-foreground">Link (optional)</label>
-                <input
-                  value={linkUrl}
-                  onChange={(e) => setLinkUrl(e.target.value)}
-                  placeholder="https://your-site.com/post"
-                  className="mt-1 w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-sm outline-none focus:border-primary focus:ring-2 focus:ring-primary/30"
+                <label
+                  htmlFor="imagePrompt"
+                  className="text-xs font-medium uppercase tracking-wide text-muted-foreground"
+                >
+                  AI Image Prompt
+                </label>
+
+                <textarea
+                  id="imagePrompt"
+                  value={
+                    content.imagePrompt
+                  }
+                  onChange={(e) =>
+                    setContent({
+                      ...content,
+                      imagePrompt:
+                        e.target.value,
+                    })
+                  }
+                  rows={6}
+                  className="mt-2 w-full rounded-lg border bg-background px-3 py-2 text-xs leading-relaxed outline-none focus:ring-2 focus:ring-primary"
                 />
+
+                <p className="mt-1 text-xs text-muted-foreground">
+                  This prompt is sent to the
+                  image generator. You can edit it
+                  and regenerate the image if
+                  needed.
+                </p>
               </div>
 
+              {/* LINK */}
               <div>
-                <label className="text-xs font-semibold text-muted-foreground">Page</label>
+                <label
+                  htmlFor="linkUrl"
+                  className="text-xs font-medium uppercase tracking-wide text-muted-foreground"
+                >
+                  Optional link
+                </label>
+
+                <input
+                  id="linkUrl"
+                  type="url"
+                  value={linkUrl}
+                  onChange={(e) =>
+                    setLinkUrl(
+                      e.target.value
+                    )
+                  }
+                  placeholder="https://example.com"
+                  className="mt-2 w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* PAGE / ACTIONS */}
+          <div className="border-t p-5">
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div>
+                <label className="text-sm font-medium">
+                  Facebook Page
+                </label>
+
                 <select
                   value={pageId}
-                  onChange={(e) => setPageId(e.target.value)}
-                  className="mt-1 w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-sm outline-none focus:border-primary"
+                  onChange={(e) =>
+                    setPageId(
+                      e.target.value
+                    )
+                  }
+                  className="mt-2 w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary"
                 >
-                  <option value="">Select a Page…</option>
-                  {pages.map((p) => (
-                    <option key={p.page_id} value={p.page_id}>
-                      {p.name}
+                  <option value="">
+                    Select a Page
+                  </option>
+
+                  {pages.map((page) => (
+                    <option
+                      key={page.page_id}
+                      value={page.page_id}
+                    >
+                      {page.name}
                     </option>
                   ))}
                 </select>
-                {pages.length === 0 && (
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    No Pages found. Connect Facebook from Settings first.
+
+                {selectedPage && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Selected:{" "}
+                    {selectedPage.name}
                   </p>
                 )}
               </div>
 
-              {scheduleOpen && (
-                <div>
-                  <label className="text-xs font-semibold text-muted-foreground">Schedule for</label>
-                  <input
-                    type="datetime-local"
-                    value={scheduledAt}
-                    onChange={(e) => setScheduledAt(e.target.value)}
-                    className="mt-1 w-full rounded-xl border border-border bg-background px-3.5 py-2.5 text-sm outline-none focus:border-primary"
-                  />
-                </div>
-              )}
-
-              <div className="flex flex-wrap gap-2 pt-2">
-                <Button variant="secondary" onClick={() => save("draft")} disabled={saving !== null}>
-                  <FloppyDisk size={16} /> Save draft
+              <div className="flex flex-col justify-end gap-2 sm:flex-row">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={
+                    saving !== null
+                  }
+                  onClick={() =>
+                    save("draft")
+                  }
+                >
+                  {saving === "draft" ? (
+                    <ArrowClockwise
+                      size={18}
+                      className="mr-2 animate-spin"
+                    />
+                  ) : (
+                    <FloppyDisk
+                      size={18}
+                      className="mr-2"
+                    />
+                  )}
+                  Save Draft
                 </Button>
-                {scheduleOpen ? (
-                  <Button variant="secondary" onClick={() => save("schedule")} disabled={saving !== null}>
-                    <CalendarPlus size={16} /> {saving === "schedule" ? "Scheduling…" : "Confirm schedule"}
-                  </Button>
-                ) : (
-                  <Button variant="secondary" onClick={() => setScheduleOpen(true)} disabled={saving !== null}>
-                    <CalendarPlus size={16} /> Schedule
-                  </Button>
-                )}
-                <Button onClick={() => save("post_now")} disabled={saving !== null}>
-                  <Rocket size={16} weight="fill" /> {saving === "post_now" ? "Publishing…" : "Publish now"}
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={
+                    saving !== null
+                  }
+                  onClick={() =>
+                    setScheduleOpen(
+                      true
+                    )
+                  }
+                >
+                  <CalendarPlus
+                    size={18}
+                    className="mr-2"
+                  />
+                  Schedule
+                </Button>
+
+                <Button
+                  type="button"
+                  disabled={
+                    saving !== null ||
+                    !pageId
+                  }
+                  onClick={() =>
+                    save("post_now")
+                  }
+                >
+                  {saving ===
+                  "post_now" ? (
+                    <ArrowClockwise
+                      size={18}
+                      className="mr-2 animate-spin"
+                    />
+                  ) : (
+                    <Rocket
+                      size={18}
+                      className="mr-2"
+                    />
+                  )}
+                  Post Now
                 </Button>
               </div>
             </div>
           </div>
         </Card>
       )}
+
+      {/* SCHEDULE MODAL */}
+      {scheduleOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <Card className="w-full max-w-md p-5">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">
+                  Schedule Post
+                </h2>
+
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Choose when Facebook should
+                  publish this post.
+                </p>
+              </div>
+
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() =>
+                  setScheduleOpen(
+                    false
+                  )
+                }
+              >
+                <X size={20} />
+              </Button>
+            </div>
+
+            <div className="mt-5 space-y-4">
+              <div>
+                <label
+                  htmlFor="scheduledAt"
+                  className="text-sm font-medium"
+                >
+                  Date and time
+                </label>
+
+                <input
+                  id="scheduledAt"
+                  type="datetime-local"
+                  value={
+                    scheduledAt
+                  }
+                  onChange={(e) =>
+                    setScheduledAt(
+                      e.target.value
+                    )
+                  }
+                  min={
+                    new Date()
+                      .toISOString()
+                      .slice(
+                        0,
+                        16
+                      )
+                  }
+                  className="mt-2 w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() =>
+                    setScheduleOpen(
+                      false
+                    )
+                  }
+                >
+                  Cancel
+                </Button>
+
+                <Button
+                  type="button"
+                  disabled={
+                    saving !== null ||
+                    !scheduledAt ||
+                    !pageId
+                  }
+                  onClick={() =>
+                    save("schedule")
+                  }
+                >
+                  {saving ===
+                  "schedule" ? (
+                    <ArrowClockwise
+                      size={18}
+                      className="mr-2 animate-spin"
+                    />
+                  ) : (
+                    <CalendarPlus
+                      size={18}
+                      className="mr-2"
+                    />
+                  )}
+                  Confirm Schedule
+                </Button>
+              </div>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }
+```
+
+[/writing]
+
+````
+
+### Perubahan penting pada file ini
+
+Sekarang **bukan lagi**:
+
+```ts
+Promise.all([
+  generateContent(topic),
+  generateImage(topic)
+])
+````
+
+Tetapi:
+
+```text
+Topic
+  ↓
+Groq / Gemini
+  ↓
+title
+description
+hashtags
+imagePrompt
+  ↓
+Gemini Image
+  ↓
+AI Image
+```
+
+Selain itu saya tambahkan **AI Image Prompt** di UI sehingga prompt yang dibuat Groq/Gemini bisa Anda lihat dan edit sebelum disimpan.
+
+### Setelah mengganti file
+
+Jalankan di `E:\facebook-auto-bot`:
+
+```powershell
+git status
+git add src/app/dashboard/generate/page.tsx
+git commit -m "Generate image from AI image prompt"
+git push origin main
+```
+
+Setelah Vercel selesai deploy, coba:
+
+**Topic:**
+
+```text
+7 tempat tersembunyi di Indonesia yang sangat indah
+```
+
+Pilih:
+
+**Image Source → AI Generated**
+
+Kemudian hasilnya harus mengikuti alur:
+
+```text
+TOPIC
+↓
+AI membuat caption viral
+↓
+AI membuat imagePrompt bahasa Inggris
+↓
+Gemini Image membaca imagePrompt tersebut
+↓
+Gambar dibuat sesuai isi caption
+```
+
+Di browser Console juga akan terlihat:
+
+```text
+[GeneratePage] Content provider: groq
+[GeneratePage] AI image prompt: ...
+[GeneratePage] Image source: ai
+```
+
+**Catatan:** saya juga mengirim `imagePrompt` saat `save()` ke `/api/posts`. Jika API/database `posts` belum menerima field tersebut, biasanya aman karena field ekstra bisa diabaikan, tetapi jika endpoint menggunakan schema ketat, kita perlu menyesuaikan `route.ts` berikutnya.

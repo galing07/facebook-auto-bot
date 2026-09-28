@@ -120,3 +120,8 @@ export async function markTopicUsed(topic: Topic): Promise<void> {
     .eq("id", topic.id);
   raise(error, "record topic use");
 }
+
+// Compatibility aliases for API route
+export const getTopics = listTopics;
+export const createTopic = addTopics;
+

@@ -1011,12 +1011,7 @@ async function applyHeadlineOverlay(
    * The original base image is never uploaded.
    */
   return new Blob(
-    [
-      outputBuffer.buffer.slice(
-        outputBuffer.byteOffset,
-        outputBuffer.byteOffset + outputBuffer.byteLength
-      ) as ArrayBuffer,
-    ],
+    [outputBuffer],
     {
       type: "image/jpeg",
     }
@@ -1312,6 +1307,3 @@ async function upload(
     source,
   };
 }
-
-
-

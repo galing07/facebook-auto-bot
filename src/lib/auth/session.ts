@@ -77,3 +77,9 @@ export const sessionCookieOptions = {
   path: "/",
   maxAge: SESSION_TTL_SECONDS,
 };
+
+// Compatibility aliases for API route
+export const createSession = createSessionToken;
+export const getSession = verifySessionToken;
+export const destroySession = async (): Promise<void> => {};
+

@@ -66,3 +66,9 @@ export async function listDuePosts(nowIso: string): Promise<Post[]> {
   if (error) throw new Error(`Failed to list due posts: ${error.message}`);
   return (data ?? []) as Post[];
 }
+
+// Compatibility aliases for API route
+export const getPosts = listPosts;
+export const createPost = createPostRecord;
+export const deletePost = deletePostRecord;
+

@@ -29,11 +29,35 @@ export function StatusBadge({ status }: { status: PostStatus }) {
   );
 }
 
-export function Badge({ className, ...props }: React.HTMLAttributes<HTMLSpanElement>) {
+type BadgeVariant =
+  | "default"
+  | "secondary"
+  | "outline"
+  | "success"
+  | "warning"
+  | "danger";
+
+const BADGE_VARIANTS: Record<BadgeVariant, string> = {
+  default: "bg-surface-2 text-foreground",
+  secondary: "bg-surface-2 text-muted-foreground",
+  outline: "border border-border bg-transparent text-foreground",
+  success: "bg-success/15 text-success",
+  warning: "bg-warning/15 text-warning",
+  danger: "bg-destructive/15 text-destructive",
+};
+
+export function Badge({
+  className,
+  variant = "default",
+  ...props
+}: React.HTMLAttributes<HTMLSpanElement> & {
+  variant?: BadgeVariant;
+}) {
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded-full border border-border bg-surface-2 px-2.5 py-1 text-xs font-medium text-muted-foreground",
+        "inline-flex items-center rounded-full border border-border px-2.5 py-1 text-xs font-medium",
+        BADGE_VARIANTS[variant],
         className
       )}
       {...props}

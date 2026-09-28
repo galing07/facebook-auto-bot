@@ -28,17 +28,14 @@ import {
 import {
   getFacebookPages,
   getFacebookOAuthUrl,
-  handleFacebookOAuthCallback,
-  getFacebookPageToken,
+  handleFacebookOAuthCallback as handleFacebookOAuthCallbackService,
 } from "@/lib/facebook/oauth";
 
 import {
   publishPostNow,
 } from "@/lib/facebook/publish";
 
-import {
-  processAutoPost,
-} from "@/lib/cron";
+import { maybeRunAutopilot } from "@/lib/autopilot";
 
 import {
   getSession,
@@ -360,8 +357,9 @@ async function requireAuth(
     }
   }
 
-  const session =
-    await getSession(req);
+  const sessionToken = req.cookies.get("pab_session")?.value;
+
+  const session = await getSession(sessionToken);
 
   if (!session) {
     return json(
@@ -722,9 +720,9 @@ async function handlePost(
           title,
           source,
           imageUrl:
-            result?.imageUrl ?? null,
+            result?.url ?? null,
           imageSource:
-            result?.imageSource ?? null,
+            result?.source ?? null,
         }
       );
 
@@ -828,15 +826,6 @@ async function handlePost(
           scheduled_at:
             data.scheduledAt ??
             null,
-
-          posted_at:
-            null,
-
-          facebook_post_id:
-            null,
-
-          error_message:
-            null,
         });
 
       /*
@@ -905,9 +894,7 @@ async function handlePost(
 
     try {
       const topic =
-        await createTopic(
-          parsed.data.text
-        );
+        await createTopic([parsed.data.text]);
 
       return json(
         topic,
@@ -1115,7 +1102,7 @@ async function handlePost(
   if (route === "cron") {
     try {
       const result =
-        await processAutoPost();
+        await maybeRunAutopilot();
 
       return json(result);
     } catch (err) {
@@ -1444,7 +1431,7 @@ async function handleDelete(
 // FACEBOOK OAUTH CALLBACK
 // ============================================================
 
-async function handleFacebookOAuthCallback(
+async function handleFacebookOAuthCallbackRoute(
   req: NextRequest
 ): Promise<Response> {
   try {
@@ -1493,14 +1480,13 @@ async function handleFacebookOAuthCallback(
     }
 
     const result =
-      await handleFacebookOAuthCallback(
-        {
-          code,
-          state,
-          requestUrl:
-            req.url,
-        }
-      );
+      await handleFacebookOAuthCallbackService(
+      {
+        code,
+        state,
+        requestUrl: req.url,
+      }
+    );
 
     return json(result);
   } catch (err) {
@@ -1553,7 +1539,7 @@ async function dispatch(
       );
     }
 
-    return handleFacebookOAuthCallback(
+    return handleFacebookOAuthCallbackRoute(
       req
     );
   }
@@ -1631,3 +1617,16 @@ export async function DELETE(
 ) {
   return dispatch(req);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+

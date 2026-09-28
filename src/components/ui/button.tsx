@@ -1,18 +1,33 @@
 import { cn } from "@/lib/cn";
 
-type Variant = "primary" | "secondary" | "ghost" | "danger";
-type Size = "sm" | "md";
+type Variant =
+  | "primary"
+  | "secondary"
+  | "ghost"
+  | "danger"
+  | "default"
+  | "outline";
+
+type Size =
+  | "sm"
+  | "md"
+  | "lg"
+  | "icon";
 
 const VARIANTS: Record<Variant, string> = {
   primary: "bg-primary text-primary-foreground hover:bg-primary-hover",
   secondary: "border border-border bg-surface text-foreground hover:bg-surface-2",
   ghost: "text-muted-foreground hover:bg-surface-2 hover:text-foreground",
   danger: "bg-destructive text-destructive-foreground hover:opacity-90",
+  default: "bg-primary text-primary-foreground hover:bg-primary-hover",
+  outline: "border border-border bg-transparent text-foreground hover:bg-surface-2",
 };
 
 const SIZES: Record<Size, string> = {
   sm: "h-9 px-3 text-sm",
-  md: "h-10.5 px-4 text-sm",
+  md: "h-10 px-4 text-sm",
+  lg: "h-11 px-6 text-base",
+  icon: "h-10 w-10 p-0",
 };
 
 export function Button({
@@ -20,7 +35,10 @@ export function Button({
   variant = "primary",
   size = "md",
   ...props
-}: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: Size }) {
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: Variant;
+  size?: Size;
+}) {
   return (
     <button
       className={cn(

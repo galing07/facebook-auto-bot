@@ -93,7 +93,7 @@ export async function maybeRunAutopilot(): Promise<AutopilotResult> {
   const topic = chosen.text;
 
   const content = await generateContent(topic);
-  const image = await generateImage(`${content.title} — ${topic}`, settings.image_source);
+  const image = await generateImage(`${content.title} — ${topic}`, settings.image_source, content.title);
 
   const draft = await createPostRecord({
     topic,
@@ -118,3 +118,5 @@ export async function maybeRunAutopilot(): Promise<AutopilotResult> {
 
   return { ran: true, post: published };
 }
+
+

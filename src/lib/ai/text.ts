@@ -224,13 +224,9 @@ const message =
 typeof data.error === "string"
 ? data.error
 : data.error?.message;
-
-```
 throw new Error(
   `Groq ${model}: ${message ?? "unknown error"}`
 );
-```
-
 }
 
 const content: unknown =
@@ -360,8 +356,6 @@ const models = [
 "openai/gpt-oss-120b",
 "openai/gpt-oss-20b",
 ];
-
-```
 for (const model of models) {
   chain.push({
     provider: "groq",
@@ -369,8 +363,6 @@ for (const model of models) {
     run: () => groqCompletion(model, topic, groqKey),
   });
 }
-```
-
 }
 
 /**
@@ -412,9 +404,7 @@ providerError:
 for (const { provider, model, run } of chain) {
 try {
 const raw = await run();
-
-```
-  const parsed = parseContent(raw);
+const parsed = parseContent(raw);
 
   console.info(
     `[generateContent] provider=${provider}` +
@@ -447,8 +437,6 @@ const raw = await run();
     message
   );
 }
-```
-
 }
 
 console.error(
@@ -462,3 +450,4 @@ provider: "template",
 providerError: failures.join(" | "),
 };
 }
+

@@ -1,9 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
-import { randomUUID } from "node:crypto";
-
-import twemoji from "@twemoji/api";
+import { randomUUID } from "crypto";
 import sharp from "sharp";
+import twemoji from "@twemoji/api";
 
 import { env } from "@/lib/env";
 import { supabaseAdmin } from "@/lib/supabase/server";
@@ -13,1517 +10,1738 @@ import type {
   ImageSourcePref,
 } from "@/lib/types";
 
-/**
- * Facebook Auto Bot
- * ------------------------------------------------------------
- * Image pipeline:
- *
- * AI:
- *   Gemini 3.1 Flash Image
- *       ↓
- *   Sharp
- *       ↓
- *   Caption rendered with exact TTF fontfile
- *       ↓
- *   Supabase Storage
- *
- * STOCK:
- *   Pexels
- *       ↓
- *   Sharp
- *       ↓
- *   Caption rendered with exact TTF fontfile
- *       ↓
- *   Supabase Storage
- *
- * IMPORTANT:
- * ------------------------------------------------------------
- * Caption is NOT rendered using SVG <text>.
- *
- * Sharp's text renderer is used directly with:
- *
- *   fontfile: absolute path to DejaVuSans-Bold.ttf
- *
- * This prevents Windows/Vercel font fallback differences.
- * ------------------------------------------------------------
- */
-
 const STORAGE_BUCKET = "post-images";
 
-const GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image";
+const GEMINI_IMAGE_MODEL =
+  "gemini-3.1-flash-image";
+
 const GEMINI_IMAGE_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/interactions";
+
+const GEMINI_TIMEOUT_MS = 90_000;
+
+const PEXELS_TIMEOUT_MS = 20_000;
+
+// ============================================================
+// FINAL IMAGE
+// ============================================================
 
 const FINAL_WIDTH = 1080;
 const FINAL_HEIGHT = 1080;
 
-const GEMINI_TIMEOUT_MS = 90_000;
-const PEXELS_TIMEOUT_MS = 20_000;
+// ============================================================
+// SOURCE RESOLUTION
+// ============================================================
 
-const FONT_FILE_NAME = "DejaVuSans-Bold.ttf";
+export function resolveImageSource(
+  pref: ImageSourcePref
+): ImageSource {
+  if (pref === "mixed") {
+    return Math.random() < 0.5
+      ? "ai"
+      : "stock";
+  }
 
-/**
- * ------------------------------------------------------------
- * FONT
- * ------------------------------------------------------------
+  return pref;
+}
+
+// ============================================================
+// GEMINI PROMPT
+// ============================================================
+
+const PHOTO_STYLE = [
+  "photorealistic",
+  "professional photography",
+  "natural lighting",
+  "realistic details",
+  "high detail",
+  "clean composition",
+  "single scene",
+  "single image",
+  "no watermark",
+  "no logo",
+  "no text",
+  "no letters",
+  "no typography",
+  "no collage",
+  "no grid",
+].join(", ");
+
+/*
+ * Detect the visual subject from the topic/prompt.
  *
- * Primary location:
- *
- *   <project-root>/fonts/DejaVuSans-Bold.ttf
- *
- * Additional fallbacks are included for local development.
+ * IMPORTANT:
+ * The topic controls WHAT the image shows.
+ * The title is only used later by Sharp as the exact headline.
  */
-
-function findFontFile(): string | null {
-  const candidates = [
-    // Vercel / project root
-    path.join(process.cwd(), "fonts", FONT_FILE_NAME),
-
-    // Public folder fallback
-    path.join(process.cwd(), "public", "fonts", FONT_FILE_NAME),
-
-    // src/lib -> project root fallback
-    path.join(process.cwd(), "..", "..", "fonts", FONT_FILE_NAME),
-
-    // Linux system font
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-
-    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-
-    "/usr/local/share/fonts/DejaVuSans-Bold.ttf",
-  ];
-
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) {
-        const stat = fs.statSync(candidate);
-
-        if (stat.isFile() && stat.size > 10_000) {
-          return candidate;
-        }
-      }
-    } catch {
-      // Ignore inaccessible candidates.
-    }
-  }
-
-  return null;
-}
-
-const FONT_FILE = findFontFile();
-
-if (FONT_FILE) {
-  console.log(`[image] Caption font: ${FONT_FILE}`);
-} else {
-  console.warn(
-    `[image] WARNING: ${FONT_FILE_NAME} not found. ` +
-      `Caption rendering will use system font fallback.`
-  );
-}
-
-/**
- * ------------------------------------------------------------
- * TYPES
- * ------------------------------------------------------------
- */
-
-interface GeminiImageResponse {
-  output_image?: {
-    data?: string;
-    mime_type?: string;
-  };
-
-  steps?: Array<{
-    type?: string;
-    content?: Array<{
-      type?: string;
-      image?: {
-        data?: string;
-        mime_type?: string;
-      };
-      data?: string;
-      mime_type?: string;
-    }>;
-  }>;
-}
-
-interface PexelsPhoto {
-  width?: number;
-  height?: number;
-
-  src?: {
-    original?: string;
-    large2x?: string;
-    large?: string;
-    medium?: string;
-  };
-}
-
-interface PexelsResponse {
-  photos?: PexelsPhoto[];
-}
-
-/**
- * ------------------------------------------------------------
- * CATEGORY DETECTION
- * ------------------------------------------------------------
- */
-
-type VisualCategory =
-  | "FOOD"
-  | "TRAVEL"
-  | "TECHNOLOGY"
-  | "HEALTH"
-  | "FASHION"
-  | "SPORTS"
-  | "NATURE"
-  | "BUSINESS"
-  | "GENERAL";
-
-const CATEGORY_KEYWORDS: Record<
-  Exclude<VisualCategory, "GENERAL">,
-  string[]
-> = {
-  FOOD: [
-    "restaurant",
-    "cooking",
-    "recipe",
-    "cuisine",
-    "food",
-    "meal",
-    "dinner",
-    "lunch",
-    "breakfast",
-    "dessert",
-    "cake",
-    "coffee",
-    "drink",
-    "chef",
-    "kitchen",
-  ],
-
-  TRAVEL: [
-    "destination",
-    "vacation",
-    "holiday",
-    "travel",
-    "tourism",
-    "beach",
-    "mountain",
-    "hotel",
-    "island",
-    "airport",
-    "trip",
-    "city",
-  ],
-
-  TECHNOLOGY: [
-    "artificial intelligence",
-    "machine learning",
-    "smartphone",
-    "computer",
-    "technology",
-    "software",
-    "robot",
-    "digital",
-    "internet",
-    "app",
-    "coding",
-    "programming",
-    "ai",
-  ],
-
-  HEALTH: [
-    "mental health",
-    "health",
-    "fitness",
-    "exercise",
-    "nutrition",
-    "wellness",
-    "doctor",
-    "medical",
-    "medicine",
-    "sleep",
-    "workout",
-    "healthy",
-  ],
-
-  FASHION: [
-    "fashion",
-    "clothing",
-    "outfit",
-    "dress",
-    "style",
-    "beauty",
-    "makeup",
-    "skincare",
-    "shoes",
-    "jewelry",
-    "model",
-  ],
-
-  SPORTS: [
-    "football",
-    "soccer",
-    "basketball",
-    "tennis",
-    "baseball",
-    "sports",
-    "athlete",
-    "running",
-    "cycling",
-    "gym",
-    "match",
-    "championship",
-  ],
-
-  NATURE: [
-    "nature",
-    "forest",
-    "mountain",
-    "ocean",
-    "sea",
-    "lake",
-    "river",
-    "wildlife",
-    "animal",
-    "garden",
-    "sunset",
-    "landscape",
-  ],
-
-  BUSINESS: [
-    "business",
-    "marketing",
-    "startup",
-    "entrepreneur",
-    "finance",
-    "money",
-    "investment",
-    "company",
-    "office",
-    "career",
-    "work",
-    "leadership",
-  ],
-};
-
-function detectCategory(text: string): VisualCategory {
-  const normalized = text.toLowerCase();
-
-  let bestCategory: VisualCategory = "GENERAL";
-  let bestScore = 0;
-
-  for (const [category, keywords] of Object.entries(
-    CATEGORY_KEYWORDS
-  )) {
-    let score = 0;
-
-    for (const keyword of keywords) {
-      if (normalized.includes(keyword)) {
-        score += keyword.length >= 8 ? 2 : 1;
-      }
-    }
-
-    if (score > bestScore) {
-      bestScore = score;
-      bestCategory = category as VisualCategory;
-    }
-  }
-
-  return bestCategory;
-}
-
-/**
- * ------------------------------------------------------------
- * FETCH WITH TIMEOUT
- * ------------------------------------------------------------
- */
-
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  timeoutMs: number
-): Promise<Response> {
-  const controller = new AbortController();
-
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, timeoutMs);
-
-  try {
-    return await fetch(url, {
-      ...init,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-/**
- * ------------------------------------------------------------
- * GEMINI IMAGE PROMPT
- * ------------------------------------------------------------
- */
-
-function buildGeminiPrompt(
-  prompt: string,
-  title?: string
-): string {
-  const category = detectCategory(
-    `${title ?? ""} ${prompt}`
-  );
-
-  return `
-Create a photorealistic, premium social-media image for a Facebook post.
-
-Topic:
-${prompt}
-
-${title ? `Headline context: ${title}` : ""}
-
-Visual category:
-${category}
-
-Requirements:
-- Square composition.
-- 1:1 aspect ratio.
-- Professional editorial photography.
-- Strong visual hierarchy.
-- High contrast.
-- Natural realistic lighting.
-- Clean composition.
-- Subject should be immediately understandable.
-- Suitable for a Facebook feed.
-- Leave enough visual breathing room for a headline overlay.
-- No text inside the generated image.
-- No captions.
-- No typography.
-- No logos.
-- No watermark.
-- No fake UI.
-- No letters.
-- No numbers.
-- No words.
-- Do not create a poster.
-- Do not create an advertisement containing text.
-
-The headline will be rendered separately by the application.
-
-Generate only the image.
-`.trim();
-}
-
-/**
- * ------------------------------------------------------------
- * GEMINI IMAGE GENERATION
- * ------------------------------------------------------------
- */
-
-async function generateWithGemini(
-  prompt: string,
-  title?: string
-): Promise<Buffer> {
-  const apiKey = env.geminiApiKey;
-
-  if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not configured.");
-  }
-
-  const finalPrompt = buildGeminiPrompt(prompt, title);
-
-  const response = await fetchWithTimeout(
-    GEMINI_IMAGE_ENDPOINT,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify({
-        model: GEMINI_IMAGE_MODEL,
-
-        input: [
-          {
-            type: "text",
-            text: finalPrompt,
-          },
-        ],
-
-        response_format: {
-          type: "image",
-          mime_type: "image/jpeg",
-          aspect_ratio: "1:1",
-          image_size: "1K",
-        },
-      }),
-    },
-    GEMINI_TIMEOUT_MS
-  );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-
-    throw new Error(
-      `Gemini image generation failed (${response.status}): ${errorText.slice(
-        0,
-        1000
-      )}`
-    );
-  }
-
-  const data =
-    (await response.json()) as GeminiImageResponse;
-
-  /**
-   * Format 1:
-   *
-   * output_image.data
-   */
-  const directImage = data.output_image?.data;
-
-  if (directImage) {
-    return Buffer.from(directImage, "base64");
-  }
-
-  /**
-   * Format 2:
-   *
-   * steps[].content[].image.data
-   */
-  for (const step of data.steps ?? []) {
-    for (const content of step.content ?? []) {
-      if (content.image?.data) {
-        return Buffer.from(
-          content.image.data,
-          "base64"
-        );
-      }
-
-      if (
-        content.type === "image" &&
-        content.data
-      ) {
-        return Buffer.from(
-          content.data,
-          "base64"
-        );
-      }
-    }
-  }
-
-  throw new Error(
-    "Gemini returned successfully but no image data was found."
-  );
-}
-
-/**
- * ------------------------------------------------------------
- * PEXELS QUERY
- * ------------------------------------------------------------
- */
-
-function buildPexelsQuery(
-  prompt: string,
-  title?: string
-): string {
-  const category = detectCategory(
-    `${title ?? ""} ${prompt}`
-  );
-
-  const categoryQueries: Record<
-    VisualCategory,
-    string
-  > = {
-    FOOD: "food cooking restaurant meal",
-    TRAVEL: "travel destination landscape",
-    TECHNOLOGY: "technology computer digital",
-    HEALTH: "health wellness fitness",
-    FASHION: "fashion lifestyle model",
-    SPORTS: "sports athlete action",
-    NATURE: "nature landscape outdoors",
-    BUSINESS: "business office professional",
-    GENERAL: "lifestyle professional editorial",
-  };
-
-  const cleaned = `${title ?? ""} ${prompt}`
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+function detectVisualCategory(
+  prompt: string
+): {
+  category: string;
+  subject: string;
+  keywords: string;
+} {
+  const text = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 
-  /**
-   * Keep query short.
-   * Pexels works better with concise keywords.
-   */
-  const words = cleaned
-    .split(" ")
-    .filter(Boolean)
-    .slice(0, 6);
+  const rules: Array<{
+    category: string;
+    keywords: string[];
+    subject: string;
+    visual: string;
+  }> = [
+    {
+      category: "FOOD",
+      keywords: [
+        "food",
+        "foods",
+        "foodie",
+        "cuisine",
+        "dish",
+        "meal",
+        "recipe",
+        "cooking",
+        "cook",
+        "restaurant",
+        "dining",
+        "eat",
+        "eating",
+        "street food",
+        "fast food",
+        "dessert",
+        "cake",
+        "pizza",
+        "burger",
+        "noodle",
+        "ramen",
+        "sushi",
+        "coffee",
+        "drink",
+        "beverage",
+        "culinary",
+        "snack",
+        "breakfast",
+        "lunch",
+        "dinner",
+      ],
+      subject:
+        "food and culinary content",
+      visual:
+        "an appetizing food dish as the clear main subject, attractive presentation, realistic ingredients, restaurant or street-food atmosphere, close-up culinary photography",
+    },
+    {
+      category: "TRAVEL",
+      keywords: [
+        "travel",
+        "traveling",
+        "travelling",
+        "tour",
+        "tourism",
+        "tourist",
+        "trip",
+        "journey",
+        "vacation",
+        "holiday",
+        "destination",
+        "explore",
+        "exploring",
+        "adventure",
+        "beach",
+        "island",
+        "mountain",
+        "waterfall",
+        "city",
+        "landmark",
+        "hotel",
+        "resort",
+        "airport",
+        "road trip",
+      ],
+      subject:
+        "travel and tourism",
+      visual:
+        "a beautiful travel destination as the clear main subject, scenic landscape or recognizable tourist environment, travel atmosphere, exploration and vacation feeling, professional travel photography",
+    },
+    {
+      category: "TECHNOLOGY",
+      keywords: [
+        "technology",
+        "tech",
+        "gadget",
+        "smartphone",
+        "phone",
+        "iphone",
+        "android",
+        "computer",
+        "laptop",
+        "software",
+        "ai",
+        "artificial intelligence",
+        "robot",
+        "internet",
+        "digital",
+        "app",
+        "device",
+        "electronics",
+      ],
+      subject:
+        "technology and digital innovation",
+      visual:
+        "modern technology as the clear main subject, contemporary devices or digital innovation, realistic workspace or technological environment, premium technology photography",
+    },
+    {
+      category: "HEALTH",
+      keywords: [
+        "health",
+        "healthy",
+        "wellness",
+        "fitness",
+        "exercise",
+        "workout",
+        "gym",
+        "nutrition",
+        "diet",
+        "healthcare",
+        "medical",
+        "doctor",
+        "medicine",
+        "wellbeing",
+        "lifestyle",
+      ],
+      subject:
+        "health and wellness",
+      visual:
+        "a realistic healthy lifestyle scene as the clear main subject, healthy food, exercise, wellness activity, or appropriate healthcare context depending on the topic",
+    },
+    {
+      category: "FASHION",
+      keywords: [
+        "fashion",
+        "style",
+        "clothing",
+        "outfit",
+        "dress",
+        "shoes",
+        "sneakers",
+        "beauty",
+        "makeup",
+        "model",
+        "designer",
+        "trend",
+        "trendy",
+      ],
+      subject:
+        "fashion and style",
+      visual:
+        "fashion and style as the clear main subject, contemporary clothing or styling, realistic editorial photography, attractive modern presentation",
+    },
+    {
+      category: "SPORTS",
+      keywords: [
+        "sport",
+        "sports",
+        "football",
+        "soccer",
+        "basketball",
+        "tennis",
+        "baseball",
+        "boxing",
+        "running",
+        "athlete",
+        "olympic",
+        "fitness",
+        "match",
+        "game",
+      ],
+      subject:
+        "sports and athletic activity",
+      visual:
+        "a realistic sports scene with the relevant athletic activity as the clear main subject, dynamic action, authentic sporting environment, professional sports photography",
+    },
+    {
+      category: "NATURE",
+      keywords: [
+        "nature",
+        "wildlife",
+        "animal",
+        "animals",
+        "forest",
+        "jungle",
+        "lake",
+        "river",
+        "ocean",
+        "sunset",
+        "sunrise",
+        "garden",
+        "flower",
+        "flowers",
+        "landscape",
+      ],
+      subject:
+        "nature and environment",
+      visual:
+        "a beautiful natural environment or relevant wildlife as the clear main subject, realistic landscape photography, natural atmosphere and detailed scenery",
+    },
+    {
+      category: "BUSINESS",
+      keywords: [
+        "business",
+        "finance",
+        "money",
+        "market",
+        "marketing",
+        "startup",
+        "entrepreneur",
+        "company",
+        "investment",
+        "economy",
+        "office",
+        "career",
+        "work",
+        "job",
+      ],
+      subject:
+        "business and professional life",
+      visual:
+        "a realistic professional business scene related to the topic, modern workplace, professional people or relevant financial/business environment, editorial business photography",
+    },
+  ];
 
-  return `${words.join(" ")} ${categoryQueries[category]}`
-    .trim()
-    .slice(0, 180);
-}
-
-/**
- * ------------------------------------------------------------
- * PEXELS IMAGE
- * ------------------------------------------------------------
- */
-
-async function generateWithPexels(
-  prompt: string,
-  title?: string
-): Promise<Buffer> {
-  const apiKey = env.pexelsApiKey;
-
-  if (!apiKey) {
-    throw new Error("PEXELS_API_KEY is not configured.");
+  for (const rule of rules) {
+    if (
+      rule.keywords.some(
+        (keyword) =>
+          text === keyword ||
+          text.includes(` ${keyword} `) ||
+          text.startsWith(`${keyword} `) ||
+          text.endsWith(` ${keyword}`)
+      )
+    ) {
+      return {
+        category: rule.category,
+        subject: rule.subject,
+        keywords: rule.visual,
+      };
+    }
   }
 
-  const query = buildPexelsQuery(
-    prompt,
-    title
+  return {
+    category: "GENERAL",
+    subject: "the topic provided",
+    keywords:
+      "a realistic scene directly representing the main subject and meaning of the topic, with the topic's primary object or activity clearly visible",
+  };
+}
+
+function buildVisualPrompt(
+  prompt: string
+): string {
+  const cleanPrompt =
+    prompt.trim();
+
+  const detected =
+    detectVisualCategory(
+      cleanPrompt
+    );
+
+  return [
+    `TOPIC: ${cleanPrompt}`,
+    `VISUAL CATEGORY: ${detected.category}`,
+    `SUBJECT: ${detected.subject}`,
+    "",
+    "CREATE THIS EXACT VISUAL SUBJECT:",
+    detected.keywords,
+    "",
+    "The image must clearly represent the topic above.",
+    "Do not create a generic lifestyle image when the topic has a specific subject.",
+    "The main subject must be immediately recognizable from the topic.",
+  ].join("\n");
+}
+
+function buildGeminiPrompt(
+  prompt: string,
+  _title: string
+): string {
+  const visualPrompt =
+    buildVisualPrompt(
+      prompt
+    );
+
+  return [
+    "Create a high-quality square social media photograph.",
+    "",
+    visualPrompt,
+    "",
+    "IMPORTANT:",
+    "- The TOPIC controls the visual subject.",
+    "- Match the image directly to the topic.",
+    "- If the topic is food, show food.",
+    "- If the topic is travel, show travel, a destination, scenery, or tourism.",
+    "- If the topic is technology, show technology.",
+    "- If the topic is health, show health or wellness.",
+    "- Do NOT substitute an unrelated subject.",
+    "- Create the image only.",
+    "- Do NOT add text, letters, words, captions, headlines, typography, signs, labels, logos, or watermarks.",
+    "- The Facebook headline will be added separately by Sharp.",
+    "",
+    "VISUAL STYLE:",
+    PHOTO_STYLE,
+    "",
+    "COMPOSITION:",
+    "- 1:1 square composition.",
+    "- Designed for a Facebook mobile feed.",
+    "- Strong visual hierarchy.",
+    "- Main subject must remain visually dominant.",
+    "- Professional social-media photography aesthetic.",
+  ].join("\n");
+}
+
+// ============================================================
+// PEXELS SEARCH QUERY
+// ============================================================
+
+function buildPexelsQuery(
+  prompt: string
+): string {
+  const detected =
+    detectVisualCategory(
+      prompt
+    );
+
+  /*
+   * Pexels needs a short photographic search query.
+   * Use the detected category + topic rather than sending
+   * the entire AI instruction to the search engine.
+   */
+  const categoryQuery: Record<
+    string,
+    string
+  > = {
+    FOOD:
+      "food culinary delicious dish",
+    TRAVEL:
+      "travel destination tourism landscape",
+    TECHNOLOGY:
+      "technology gadgets digital",
+    HEALTH:
+      "healthy lifestyle wellness fitness",
+    FASHION:
+      "fashion style clothing",
+    SPORTS:
+      "sports athlete action",
+    NATURE:
+      "nature landscape wildlife",
+    BUSINESS:
+      "business professional office",
+    GENERAL:
+      "lifestyle",
+  };
+
+  const categoryBase =
+    categoryQuery[
+      detected.category
+    ] ??
+    "lifestyle";
+
+  /*
+   * Extract the actual topic from the AI-generated prompt.
+   * Remove visual-generation instructions so Pexels searches
+   * for the real subject instead of phrases such as
+   * "cinematic photograph related to".
+   */
+  const topicText =
+    prompt
+      .replace(
+        /^a\s+realistic\s+cinematic\s+photograph\s+related\s+to\s+/i,
+        " "
+      )
+      .replace(
+        /^a\s+realistic\s+photograph\s+related\s+to\s+/i,
+        " "
+      )
+      .replace(
+        /visually compelling composition/gi,
+        " "
+      )
+      .replace(
+        /natural lighting/gi,
+        " "
+      )
+      .replace(
+        /high detail/gi,
+        " "
+      )
+      .replace(
+        /realistic photography/gi,
+        " "
+      )
+      .replace(
+        /professional facebook social media design/gi,
+        " "
+      )
+      .replace(
+        /1:1 square composition/gi,
+        " "
+      )
+      .replace(
+        /bold overlay text/gi,
+        " "
+      )
+      .replace(
+        /centered near the bottom/gi,
+        " "
+      )
+      .replace(
+        /large modern bold typography/gi,
+        " "
+      )
+      .replace(
+        /subtle dark contrast box/gi,
+        " "
+      )
+      .replace(
+        /highly readable on a mobile screen/gi,
+        " "
+      )
+      .replace(
+        /no hashtags|no url|no logo|no watermark|no text|no letters|no words|no captions|no headlines|no typography/gi,
+        " "
+      )
+      .replace(
+        /[^a-zA-Z0-9À-ÿ\s-]/g,
+        " "
+      )
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
+
+  const topicWords =
+    topicText
+      .split(/\s+/)
+      .filter(Boolean);
+
+  /*
+   * Remove generic words and keep the actual topic.
+   */
+  const genericWords =
+    new Set([
+      "today",
+      "new",
+      "latest",
+      "viral",
+      "worth",
+      "look",
+      "must",
+      "see",
+      "interesting",
+      "amazing",
+      "beautiful",
+      "best",
+      "news",
+      "trending",
+      "trend",
+    ]);
+
+  const usefulWords =
+    topicWords
+      .filter(
+        (word) =>
+          !genericWords.has(
+            word.toLowerCase()
+          )
+      )
+      .slice(0, 6);
+
+  const query = [
+    categoryBase,
+    ...usefulWords,
+  ]
+    .join(" ")
+    .trim();
+
+  console.info(
+    `[IMAGE] Visual category=${detected.category} Pexels query="${query}"`
   );
 
-  const url =
-    "https://api.pexels.com/v1/search?" +
-    new URLSearchParams({
-      query,
-      orientation: "square",
-      size: "large",
-      per_page: "15",
-    }).toString();
+  return query || categoryBase;
+}
 
-  const response = await fetchWithTimeout(
-    url,
-    {
-      method: "GET",
-      headers: {
-        Authorization: apiKey,
+// ============================================================
+// GEMINI IMAGE GENERATION
+// ============================================================
+
+// ============================================================
+
+async function fetchGeminiImageBytes(
+  prompt: string,
+  title: string
+): Promise<Blob> {
+  const apiKey =
+    env.geminiApiKey;
+
+  if (!apiKey) {
+    throw new Error(
+      "GEMINI_API_KEY is not configured"
+    );
+  }
+
+  const cleanTitle =
+    title.trim();
+
+  if (!cleanTitle) {
+    throw new Error(
+      "Facebook headline is required before Gemini image generation."
+    );
+  }
+
+  const finalPrompt =
+    buildGeminiPrompt(
+      prompt,
+      cleanTitle
+    );
+
+  console.info(
+    `[IMAGE] Gemini starting model=${GEMINI_IMAGE_MODEL}`
+  );
+
+  console.info(
+    `[IMAGE] Gemini headline="${cleanTitle}"`
+  );
+
+  const requestBody = {
+    model:
+      GEMINI_IMAGE_MODEL,
+
+    input: [
+      {
+        type: "text",
+        text: finalPrompt,
       },
+    ],
+
+    response_format: {
+      type: "image",
+      mime_type: "image/jpeg",
+      aspect_ratio: "1:1",
+      image_size: "1K",
     },
-    PEXELS_TIMEOUT_MS
+  };
+
+  const response =
+    await fetch(
+      GEMINI_IMAGE_ENDPOINT,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+
+          "x-goog-api-key":
+            apiKey,
+        },
+
+        body:
+          JSON.stringify(
+            requestBody
+          ),
+
+        signal:
+          AbortSignal.timeout(
+            GEMINI_TIMEOUT_MS
+          ),
+      }
+    );
+
+  const body =
+    await response.text();
+
+  console.info(
+    `[IMAGE] Gemini HTTP ${response.status}`
   );
 
   if (!response.ok) {
-    const errorText = await response.text();
+    console.error(
+      "[IMAGE] Gemini API error:",
+      body.slice(0, 1500)
+    );
 
     throw new Error(
-      `Pexels request failed (${response.status}): ${errorText.slice(
+      `Gemini image API HTTP ${response.status}: ${body.slice(
         0,
         500
       )}`
     );
   }
 
-  const data =
-    (await response.json()) as PexelsResponse;
+  let data: any;
 
-  const photos = (data.photos ?? []).filter(
-    (photo) =>
-      Boolean(
-        photo.src?.large2x ||
-          photo.src?.large ||
-          photo.src?.original
-      )
-  );
+  try {
+    data =
+      JSON.parse(body);
+  } catch {
+    console.error(
+      "[IMAGE] Gemini returned non-JSON:",
+      body.slice(0, 1000)
+    );
 
-  if (!photos.length) {
     throw new Error(
-      `Pexels returned no usable images for "${query}".`
+      "Gemini returned invalid JSON"
     );
   }
 
-  /**
-   * Randomize result so repeated posts don't always
-   * use the first Pexels image.
-   */
-  const photo =
-    photos[
-      Math.floor(Math.random() * photos.length)
+  // ==========================================================
+  // PRIMARY: output_image.data
+  // ==========================================================
+
+  const outputImage =
+    data?.output_image;
+
+  if (
+    outputImage &&
+    typeof outputImage.data ===
+      "string" &&
+    outputImage.data.length > 0
+  ) {
+    const mimeType =
+      typeof outputImage.mime_type ===
+      "string"
+        ? outputImage.mime_type
+        : "image/jpeg";
+
+    const bytes =
+      Buffer.from(
+        outputImage.data,
+        "base64"
+      );
+
+    if (bytes.length === 0) {
+      throw new Error(
+        "Gemini returned empty image data"
+      );
+    }
+
+    console.info(
+      `[IMAGE] Gemini SUCCESS output_image bytes=${bytes.length}`
+    );
+
+    return new Blob(
+      [bytes],
+      {
+        type: mimeType,
+      }
+    );
+  }
+
+  // ==========================================================
+  // SECONDARY: steps[].content[]
+  // ==========================================================
+
+  const steps =
+    Array.isArray(data?.steps)
+      ? data.steps
+      : [];
+
+  for (const step of steps) {
+    const content =
+      Array.isArray(step?.content)
+        ? step.content
+        : [];
+
+    for (const item of content) {
+      if (
+        item?.type === "image" &&
+        typeof item?.data ===
+          "string" &&
+        item.data.length > 0
+      ) {
+        const mimeType =
+          typeof item.mime_type ===
+          "string"
+            ? item.mime_type
+            : "image/jpeg";
+
+        const bytes =
+          Buffer.from(
+            item.data,
+            "base64"
+          );
+
+        if (bytes.length === 0) {
+          continue;
+        }
+
+        console.info(
+          `[IMAGE] Gemini SUCCESS steps image bytes=${bytes.length}`
+        );
+
+        return new Blob(
+          [bytes],
+          {
+            type: mimeType,
+          }
+        );
+      }
+    }
+  }
+
+  console.error(
+    "[IMAGE] Gemini response contained no image."
+  );
+
+  console.error(
+    "[IMAGE] Gemini response keys:",
+    Object.keys(data ?? {})
+  );
+
+  throw new Error(
+    "Gemini completed but returned no image data"
+  );
+}
+
+// ============================================================
+// PEXELS
+// ============================================================
+
+async function fetchStockImageBytes(
+  prompt: string
+): Promise<Blob> {
+  const apiKey =
+    env.pexelsApiKey;
+
+  if (!apiKey) {
+    throw new Error(
+      "PEXELS_API_KEY is not configured"
+    );
+  }
+
+  const query =
+    buildPexelsQuery(
+      prompt
+    );
+
+  console.info(
+    `[IMAGE] Pexels query="${query}"`
+  );
+
+  const searchUrl =
+    new URL(
+      "https://api.pexels.com/v1/search"
+    );
+
+  searchUrl.searchParams.set(
+    "query",
+    query
+  );
+
+  searchUrl.searchParams.set(
+    "orientation",
+    "square"
+  );
+
+  searchUrl.searchParams.set(
+    "size",
+    "large"
+  );
+
+  searchUrl.searchParams.set(
+    "per_page",
+    "15"
+  );
+
+  const response =
+    await fetch(
+      searchUrl.toString(),
+      {
+        method: "GET",
+
+        headers: {
+          Authorization:
+            apiKey,
+        },
+
+        signal:
+          AbortSignal.timeout(
+            PEXELS_TIMEOUT_MS
+          ),
+      }
+    );
+
+  const body =
+    await response.text();
+
+  console.info(
+    `[IMAGE] Pexels HTTP ${response.status}`
+  );
+
+  if (!response.ok) {
+    console.error(
+      "[IMAGE] Pexels API error:",
+      body.slice(0, 1000)
+    );
+
+    throw new Error(
+      `Pexels HTTP ${response.status}: ${body.slice(
+        0,
+        500
+      )}`
+    );
+  }
+
+  let data: any;
+
+  try {
+    data =
+      JSON.parse(body);
+  } catch {
+    throw new Error(
+      "Pexels returned invalid JSON"
+    );
+  }
+
+  const photos =
+    Array.isArray(data?.photos)
+      ? data.photos
+      : [];
+
+  if (photos.length === 0) {
+    throw new Error(
+      `Pexels returned no photos for query "${query}"`
+    );
+  }
+
+  const validPhotos =
+    photos.filter(
+      (photo: any) =>
+        typeof photo?.src?.large2x ===
+          "string" ||
+        typeof photo?.src?.large ===
+          "string"
+    );
+
+  if (
+    validPhotos.length === 0
+  ) {
+    throw new Error(
+      "Pexels returned photos without usable URLs"
+    );
+  }
+
+  const selected =
+    validPhotos[
+      Math.floor(
+        Math.random() *
+          validPhotos.length
+      )
     ];
 
   const imageUrl =
-    photo.src?.large2x ??
-    photo.src?.large ??
-    photo.src?.original;
+    selected.src.large2x ??
+    selected.src.large;
 
-  if (!imageUrl) {
-    throw new Error(
-      "Pexels photo has no usable image URL."
-    );
-  }
+  console.info(
+    "[IMAGE] Pexels downloading selected photo"
+  );
 
   const imageResponse =
-    await fetchWithTimeout(
+    await fetch(
       imageUrl,
       {
         method: "GET",
-      },
-      PEXELS_TIMEOUT_MS
+
+        signal:
+          AbortSignal.timeout(
+            PEXELS_TIMEOUT_MS
+          ),
+      }
     );
 
   if (!imageResponse.ok) {
     throw new Error(
-      `Pexels image download failed (${imageResponse.status}).`
+      `Pexels image download HTTP ${imageResponse.status}`
     );
   }
 
-  const arrayBuffer =
-    await imageResponse.arrayBuffer();
+  const blob =
+    await imageResponse.blob();
 
-  return Buffer.from(arrayBuffer);
-}
-
-/**
- * ------------------------------------------------------------
- * HEADLINE CLEANUP
- * ------------------------------------------------------------
- */
-
-function cleanHeadline(
-  value: string | undefined | null
-): string {
-  if (!value) {
-    return "";
+  if (
+    !blob.type ||
+    !blob.type.startsWith(
+      "image/"
+    )
+  ) {
+    throw new Error(
+      `Pexels returned invalid content type: ${blob.type}`
+    );
   }
 
+  if (blob.size === 0) {
+    throw new Error(
+      "Pexels returned an empty image"
+    );
+  }
+
+  console.info(
+    `[IMAGE] Pexels SUCCESS size=${blob.size} type=${blob.type}`
+  );
+
+  return blob;
+}
+
+// ============================================================
+// SVG ESCAPE
+// ============================================================
+
+function escapeXml(
+  value: string
+): string {
   return value
-    .replace(/[\r\n]+/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .replace(
+      /&/g,
+      "&amp;"
+    )
+    .replace(
+      /</g,
+      "&lt;"
+    )
+    .replace(
+      />/g,
+      "&gt;"
+    )
+    .replace(
+      /"/g,
+      "&quot;"
+    )
+    .replace(
+      /'/g,
+      "&apos;"
+    );
+}
+
+// ============================================================
+// REMOVE UNSAFE CHARACTERS
+// ============================================================
+
+function cleanHeadline(
+  title: string
+): string {
+  return title
+    .trim()
+    // Remove control characters only.
+    // IMPORTANT: preserve emoji such as 🌙, 🔥, ✈️, 🍜, etc.
+    .replace(
+      /[\u0000-\u001F\u007F]/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
     .trim();
 }
 
-/**
- * ------------------------------------------------------------
- * WORD WRAPPING
- * ------------------------------------------------------------
- *
- * Maximum 3 lines.
- */
+// ============================================================
+// HEADLINE WRAPPING
+// ============================================================
 
 function wrapHeadline(
-  headline: string,
-  maxCharsPerLine = 24,
-  maxLines = 3
-): string {
-  const words = headline
-    .split(/\s+/)
-    .filter(Boolean);
+  title: string,
+  maxChars = 22
+): string[] {
+  const words =
+    title
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+
+  if (words.length === 0) {
+    return [];
+  }
 
   const lines: string[] = [];
+
   let current = "";
 
   for (const word of words) {
-    const candidate = current
-      ? `${current} ${word}`
-      : word;
-
+    /*
+     * Handle a single very long word.
+     */
     if (
-      candidate.length <= maxCharsPerLine ||
+      word.length >
+        maxChars &&
       !current
     ) {
-      current = candidate;
+      lines.push(
+        word.slice(
+          0,
+          maxChars
+        )
+      );
+
+      current =
+        word.slice(
+          maxChars
+        );
+
       continue;
     }
 
-    lines.push(current);
-    current = word;
+    const candidate =
+      current
+        ? `${current} ${word}`
+        : word;
 
-    if (lines.length === maxLines - 1) {
-      break;
+    if (
+      candidate.length <=
+      maxChars
+    ) {
+      current =
+        candidate;
+    } else {
+      if (current) {
+        lines.push(
+          current
+        );
+      }
+
+      current =
+        word;
     }
   }
 
-  if (current && lines.length < maxLines) {
-    lines.push(current);
-  }
-
-  /**
-   * If words remain, append an ellipsis.
-   */
-  if (lines.length === maxLines) {
-    const usedWords = lines
-      .join(" ")
-      .split(/\s+/).length;
-
-    if (usedWords < words.length) {
-      lines[maxLines - 1] =
-        lines[maxLines - 1]
-          .replace(/[.…]+$/g, "")
-          .trimEnd() + "…";
-    }
-  }
-
-  return lines.join("\n");
-}
-
-/**
- * ------------------------------------------------------------
- * XML / PANGO ESCAPE
- * ------------------------------------------------------------
- */
-
-function escapePangoText(value: string): string {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-/**
- * ------------------------------------------------------------
- * FONT SIZE
- * ------------------------------------------------------------
- */
-
-function getHeadlineFontSize(
-  lines: string[]
-): number {
-  const longest = Math.max(
-    ...lines.map((line) => line.length)
-  );
-
-  if (lines.length >= 3) {
-    if (longest > 24) return 48;
-    if (longest > 20) return 54;
-    return 60;
-  }
-
-  if (longest > 30) return 52;
-  if (longest > 24) return 60;
-  if (longest > 18) return 68;
-
-  return 76;
-}
-
-/**
- * ------------------------------------------------------------
- * CREATE TEXT LAYER
- * ------------------------------------------------------------
- *
- * This is the important fix.
- *
- * Instead of:
- *
- *   SVG <text font-family="HeadlineFont">
- *
- * we use:
- *
- *   sharp({
- *     text: {
- *       fontfile: "/absolute/path/to/font.ttf"
- *     }
- *   })
- *
- * Sharp officially supports `fontfile` as an absolute
- * filesystem path. This avoids relying on whichever font
- * happens to exist on the Vercel Linux runtime.
- */
-
-async function createTextLayer(
-  text: string,
-  options: {
-    color: string;
-    fontSize: number;
-    width: number;
-    height: number;
-  }
-): Promise<Buffer> {
-  const safeText = escapePangoText(text);
-
-  const fontName = FONT_FILE
-    ? "DejaVu Sans Bold"
-    : "sans Bold";
-
-  const fontDefinition =
-    `${fontName} ${options.fontSize}`;
-
-  const pangoText =
-    `<span foreground="${options.color}">${safeText}</span>`;
-
-  const textInput: Parameters<
-    typeof sharp
-  >[0] = {
-    text: {
-      text: pangoText,
-      font: fontDefinition,
-      width: options.width,
-      height: options.height,
-      align: "center",
-      rgba: true,
-      spacing: 8,
-
-      ...(FONT_FILE
-        ? {
-            fontfile: FONT_FILE,
-          }
-        : {}),
-    },
-  };
-
-  return sharp(textInput)
-    .png()
-    .toBuffer();
-}
-
-/**
- * ------------------------------------------------------------
- * TWEMOJI
- * ------------------------------------------------------------
- *
- * We don't use SVG text for the headline anymore.
- *
- * Twemoji is only used as an image overlay.
- */
-
-function getTwemojiCodePoint(
-  value: string
-): string {
-  return [...value]
-    .map((char) => {
-      const code = char
-        .codePointAt(0)
-        ?.toString(16);
-
-      return code ?? "";
-    })
-    .filter(Boolean)
-    .join("-");
-}
-
-async function fetchTwemoji(
-  emoji: string
-): Promise<Buffer | null> {
-  const codePoint =
-    getTwemojiCodePoint(emoji);
-
-  if (!codePoint) {
-    return null;
-  }
-
-  const url =
-    `https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/${codePoint}.svg`;
-
-  try {
-    const response = await fetchWithTimeout(
-      url,
-      {
-        headers: {
-          Accept: "image/svg+xml",
-        },
-      },
-      10_000
+  if (current) {
+    lines.push(
+      current
     );
+  }
 
-    if (!response.ok) {
+  /*
+   * Maximum three lines.
+   */
+  if (lines.length <= 3) {
+    return lines;
+  }
+
+  const first =
+    lines[0];
+
+  const second =
+    lines[1];
+
+  const remaining =
+    lines
+      .slice(2)
+      .join(" ");
+
+  return [
+    first,
+    second,
+    remaining,
+  ];
+}
+
+// ============================================================
+// HEADLINE SVG
+// ============================================================
+
+async function createHeadlineSvg(
+  title: string
+): Promise<Buffer> {
+  const cleanTitle = cleanHeadline(title);
+  if (!cleanTitle) throw new Error("Headline title is empty after cleaning.");
+
+  const lines = wrapHeadline(cleanTitle, 22);
+  if (lines.length === 0) throw new Error("Unable to create headline overlay.");
+
+  const fontSize = lines.length === 1 ? 88 : lines.length === 2 ? 72 : 62;
+  const lineHeight = fontSize + 18;
+  const totalTextHeight = lines.length * lineHeight;
+  const firstTextY = FINAL_HEIGHT - totalTextHeight - 75;
+
+  const twemojiBase =
+    "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/";
+
+  const emojiRegex =
+    /(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F|\u200D(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F)?)*|\uFE0F/gu;
+
+  const emojiCache = new Map<string, string>();
+
+  async function emojiDataUri(emoji: string): Promise<string | null> {
+    const codePoint = twemoji.convert.toCodePoint(emoji).toLowerCase();
+    if (!codePoint) return null;
+
+    const cached = emojiCache.get(codePoint);
+    if (cached) return cached;
+
+    const url = `${twemojiBase}${codePoint}.svg`;
+
+    try {
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        console.warn(
+          `[IMAGE] Twemoji HTTP ${response.status} for ${emoji} (${codePoint})`
+        );
+        return null;
+      }
+
+      const svgText = await response.text();
+
+      const dataUri =
+        `data:image/svg+xml;base64,${Buffer.from(svgText, "utf8").toString("base64")}`;
+
+      emojiCache.set(codePoint, dataUri);
+      return dataUri;
+    } catch (error) {
+      console.warn(`[IMAGE] Twemoji fetch failed for ${emoji}:`, error);
       return null;
     }
+  }
 
-    const svg =
-      await response.arrayBuffer();
+  const lineElements = await Promise.all(
+    lines.map(async (line, index) => {
+      const y = firstTextY + index * lineHeight;
 
-    return await sharp(
-      Buffer.from(svg)
+      const match = line.match(emojiRegex);
+
+      let textPart = line;
+      let emojiPart: string | null = null;
+
+      if (match && match.index !== undefined) {
+        textPart = line.slice(0, match.index).trimEnd();
+        emojiPart = match[0];
+      }
+
+      const upperText = textPart.toUpperCase();
+
+      // Conservative width estimate for DejaVu Sans.
+      // This intentionally leaves extra room before the emoji.
+      const textWidth =
+        upperText.length * fontSize * 0.66;
+
+      const emojiWidth = emojiPart
+        ? fontSize * 0.82
+        : 0;
+
+      // IMPORTANT:
+      // Emoji gets a fixed 28px gap from the final text glyph.
+      const emojiGap = emojiPart ? 36 : 0;
+
+      const totalWidth =
+        textWidth +
+        (emojiPart ? emojiGap + emojiWidth : 0);
+
+      let x = 540 - totalWidth / 2;
+
+      const elements: string[] = [];
+
+      if (upperText) {
+        const safeText = escapeXml(upperText);
+
+        elements.push(
+          `<text x="${x.toFixed(2)}" y="${y}" text-anchor="start" dominant-baseline="alphabetic" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fontSize}px" font-weight="900" fill="#FFFFFF" stroke="#000000" stroke-width="10" stroke-linejoin="round" paint-order="stroke">${safeText}</text>`
+        );
+
+        x += textWidth;
+      }
+
+      if (emojiPart) {
+        x += emojiGap;
+
+        const dataUri = await emojiDataUri(emojiPart);
+
+        if (dataUri) {
+          const emojiY = y - fontSize * 0.84;
+
+          elements.push(
+            `<image x="${x.toFixed(2)}" y="${emojiY.toFixed(2)}" width="${emojiWidth.toFixed(2)}" height="${emojiWidth.toFixed(2)}" href="${dataUri}" preserveAspectRatio="xMidYMid meet" />`
+          );
+        }
+      }
+
+      return `<g>${elements.join("\n")}</g>`;
+    })
+  );
+
+  const svg = `
+    <svg
+      width="${FINAL_WIDTH}"
+      height="${FINAL_HEIGHT}"
+      viewBox="0 0 ${FINAL_WIDTH} ${FINAL_HEIGHT}"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <defs>
+        <filter
+          id="headlineShadow"
+          x="-20%"
+          y="-20%"
+          width="140%"
+          height="140%"
+        >
+          <feDropShadow
+            dx="0"
+            dy="4"
+            stdDeviation="4"
+            flood-color="#000000"
+            flood-opacity="0.85"
+          />
+        </filter>
+      </defs>
+
+      <g filter="url(#headlineShadow)">
+        ${lineElements.join("\n")}
+      </g>
+    </svg>
+  `;
+
+  return Buffer.from(svg, "utf8");
+}
+async function applyHeadlineOverlay(
+  blob: Blob,
+  title: string
+): Promise<Blob> {
+  const cleanTitle =
+    cleanHeadline(
+      title
+    );
+
+  /*
+   * CRITICAL:
+   *
+   * Never silently return the original image.
+   *
+   * If title is missing, generation FAILS.
+   */
+  if (!cleanTitle) {
+    throw new Error(
+      "Cannot generate final image: Facebook headline/title is empty."
+    );
+  }
+
+  console.info(
+    `[IMAGE] REQUIRED HEADLINE="${cleanTitle}"`
+  );
+
+  console.info(
+    `[IMAGE] OVERLAY START title="${cleanTitle}"`
+  );
+
+  const inputBuffer =
+    Buffer.from(
+      await blob.arrayBuffer()
+    );
+
+  if (
+    inputBuffer.length === 0
+  ) {
+    throw new Error(
+      "Cannot apply headline: source image is empty."
+    );
+  }
+
+  /*
+   * First normalize the source image.
+   */
+  const baseImage =
+    await sharp(
+      inputBuffer
     )
-      .png()
-      .toBuffer();
-  } catch {
-    return null;
-  }
-}
-
-/**
- * ------------------------------------------------------------
- * SIMPLE EMOJI EXTRACTION
- * ------------------------------------------------------------
- *
- * We deliberately handle the common emoji ranges.
- * Unknown emoji remain part of the text.
- */
-
-function extractSimpleEmoji(
-  text: string
-): {
-  text: string;
-  emoji: string[];
-} {
-  const emoji: string[] = [];
-
-  const result = text.replace(
-    /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu,
-    (match) => {
-      emoji.push(match);
-      return "";
-    }
-  );
-
-  return {
-    text: result
-      .replace(/\s+/g, " ")
-      .trim(),
-    emoji,
-  };
-}
-
-/**
- * ------------------------------------------------------------
- * ADD HEADLINE
- * ------------------------------------------------------------
- */
-
-async function addHeadline(
-  image: Buffer,
-  title?: string
-): Promise<Buffer> {
-  const headline = cleanHeadline(title);
-
-  if (!headline) {
-    return image;
-  }
-
-  const {
-    text: headlineWithoutEmoji,
-    emoji,
-  } = extractSimpleEmoji(headline);
-
-  const wrapped = wrapHeadline(
-    headlineWithoutEmoji || headline
-  );
-
-  const lines = wrapped.split("\n");
-
-  const fontSize =
-    getHeadlineFontSize(lines);
-
-  /**
-   * Main text area.
-   */
-  const textWidth = 920;
-  const textHeight =
-    lines.length >= 3 ? 300 : 240;
-
-  /**
-   * Black outline layer.
-   */
-  const blackLayer =
-    await createTextLayer(
-      wrapped,
-      {
-        color: "#000000",
-        fontSize: fontSize + 5,
-        width: textWidth,
-        height: textHeight,
-      }
-    );
-
-  /**
-   * White main layer.
-   */
-  const whiteLayer =
-    await createTextLayer(
-      wrapped,
-      {
-        color: "#FFFFFF",
-        fontSize,
-        width: textWidth,
-        height: textHeight,
-      }
-    );
-
-  /**
-   * Slight translucent dark panel.
-   *
-   * This makes white text readable on both light
-   * and dark images.
-   */
-  const panelHeight =
-    lines.length >= 3 ? 360 : 300;
-
-  const panel =
-    await sharp({
-      create: {
-        width: FINAL_WIDTH,
-        height: panelHeight,
-        channels: 4,
-        background: {
-          r: 0,
-          g: 0,
-          b: 0,
-          alpha: 0.28,
-        },
-      },
-    })
-      .png()
-      .toBuffer();
-
-  /**
-   * Composite text toward the bottom.
-   */
-  let output =
-    sharp(image).composite([
-      {
-        input: panel,
-        gravity: "south",
-      },
-
-      /**
-       * Black outline.
-       */
-      {
-        input: blackLayer,
-        gravity: "south",
-        top: -120,
-      },
-
-      {
-        input: blackLayer,
-        gravity: "south",
-        top: -124,
-      },
-
-      {
-        input: blackLayer,
-        gravity: "south",
-        left: -3,
-        top: -122,
-      },
-
-      {
-        input: blackLayer,
-        gravity: "south",
-        left: 3,
-        top: -122,
-      },
-
-      /**
-       * White main text.
-       */
-      {
-        input: whiteLayer,
-        gravity: "south",
-        top: -122,
-      },
-    ]);
-
-  /**
-   * Add one Twemoji image if the title contains emoji.
-   *
-   * Multiple emoji are intentionally combined into a
-   * compact visual row.
-   */
-  if (emoji.length > 0) {
-    const uniqueEmoji = [
-      ...new Set(emoji),
-    ].slice(0, 3);
-
-    const emojiBuffers: Buffer[] = [];
-
-    for (const item of uniqueEmoji) {
-      const buffer =
-        await fetchTwemoji(item);
-
-      if (buffer) {
-        emojiBuffers.push(buffer);
-      }
-    }
-
-    if (emojiBuffers.length) {
-      const emojiSize =
-        lines.length >= 3 ? 58 : 66;
-
-      const resized =
-        await Promise.all(
-          emojiBuffers.map((buffer) =>
-            sharp(buffer)
-              .resize({
-                width: emojiSize,
-                height: emojiSize,
-                fit: "contain",
-              })
-              .png()
-              .toBuffer()
-          )
-        );
-
-      /**
-       * Build emoji strip.
-       */
-      const stripWidth =
-        resized.length * emojiSize +
-        Math.max(0, resized.length - 1) * 8;
-
-      let strip =
-        sharp({
-          create: {
-            width: stripWidth,
-            height: emojiSize,
-            channels: 4,
-            background: {
-              r: 0,
-              g: 0,
-              b: 0,
-              alpha: 0,
-            },
-          },
-        });
-
-      const emojiComposite =
-        resized.map(
-          (buffer, index) => ({
-            input: buffer,
-            left:
-              index *
-              (emojiSize + 8),
-            top: 0,
-          })
-        );
-
-      const stripBuffer =
-        await strip
-          .composite(emojiComposite)
-          .png()
-          .toBuffer();
-
-      output =
-        output.composite([
-          {
-            input: stripBuffer,
-            gravity: "south",
-            top: -35,
-          },
-        ]);
-    }
-  }
-
-  return output
-    .jpeg({
-      quality: 92,
-      chromaSubsampling: "4:4:4",
-      progressive: true,
-    })
-    .toBuffer();
-}
-
-/**
- * ------------------------------------------------------------
- * PREPARE FINAL IMAGE
- * ------------------------------------------------------------
- */
-
-async function composeFinalImage(
-  sourceImage: Buffer,
-  title?: string
-): Promise<Buffer> {
-  /**
-   * autoOrient:
-   * Prevents images with EXIF orientation from appearing
-   * rotated incorrectly.
-   *
-   * cover:
-   * Guarantees exactly 1080x1080.
-   */
-  const square =
-    await sharp(sourceImage)
-      .autoOrient()
-      .resize({
-        width: FINAL_WIDTH,
-        height: FINAL_HEIGHT,
-        fit: "cover",
-        position: "attention",
-        withoutEnlargement: false,
-      })
-      .flatten({
-        background: "#111111",
-      })
+      .resize(
+        FINAL_WIDTH,
+        FINAL_HEIGHT,
+        {
+          fit: "cover",
+          position: "centre",
+        }
+      )
       .jpeg({
-        quality: 94,
-        chromaSubsampling: "4:4:4",
+        quality: 92,
+        mozjpeg: true,
       })
       .toBuffer();
 
-  return addHeadline(
-    square,
-    title
+  if (
+    baseImage.length === 0
+  ) {
+    throw new Error(
+      "Base image processing produced empty output."
+    );
+  }
+
+  const svgOverlay =
+    await createHeadlineSvg(
+      cleanTitle
+    );
+
+  /*
+   * Composite the headline.
+   */
+  const outputBuffer =
+    await sharp(
+      baseImage
+    )
+      .composite([
+        {
+          input:
+            svgOverlay,
+
+          top: 0,
+
+          left: 0,
+        },
+      ])
+      .jpeg({
+        quality: 92,
+        mozjpeg: true,
+      })
+      .toBuffer();
+
+  if (
+    outputBuffer.length === 0
+  ) {
+    throw new Error(
+      "Headline overlay produced an empty image."
+    );
+  }
+
+  /*
+   * VERIFY FINAL IMAGE.
+   */
+  const metadata =
+    await sharp(
+      outputBuffer
+    ).metadata();
+
+  if (
+    !metadata.width ||
+    !metadata.height
+  ) {
+    throw new Error(
+      "Headline overlay verification failed: invalid final image."
+    );
+  }
+
+  console.info(
+    `[IMAGE] OVERLAY SUCCESS title="${cleanTitle}" width=${metadata.width} height=${metadata.height} bytes=${outputBuffer.length}`
+  );
+
+  /*
+   * IMPORTANT:
+   *
+   * Only this final image is returned.
+   * The original base image is never uploaded.
+   */
+  return new Blob(
+    [
+      outputBuffer.buffer.slice(
+        outputBuffer.byteOffset,
+        outputBuffer.byteOffset + outputBuffer.byteLength
+      ) as ArrayBuffer,
+    ],
+    {
+      type: "image/jpeg",
+    }
   );
 }
 
-/**
- * ------------------------------------------------------------
- * SUPABASE UPLOAD
- * ------------------------------------------------------------
- */
+// ============================================================
+// PUBLIC GENERATOR
+// ============================================================
 
-async function uploadImage(
-  image: Buffer
-): Promise<string> {
-  const supabase =
+export async function generateImage(
+  prompt: string,
+  pref: ImageSourcePref,
+  title: string
+): Promise<{
+  url: string;
+  source: ImageSource;
+}> {
+  const cleanPrompt =
+    prompt.trim();
+
+  const cleanTitle =
+    cleanHeadline(
+      title
+    );
+
+  if (!cleanPrompt) {
+    throw new Error(
+      "Image prompt is required."
+    );
+  }
+
+  /*
+   * CRITICAL:
+   *
+   * Title is mandatory.
+   */
+  if (!cleanTitle) {
+    throw new Error(
+      "Facebook headline/title is required for image generation."
+    );
+  }
+
+  const source =
+    resolveImageSource(
+      pref
+    );
+
+  console.info(
+    `[IMAGE] REQUESTED SOURCE=${source}`
+  );
+
+  console.info(
+    `[IMAGE] REQUIRED HEADLINE="${cleanTitle}"`
+  );
+
+  // ==========================================================
+  // AI SOURCE
+  // Gemini -> Sharp -> upload
+  // Pexels fallback -> Sharp -> upload
+  // ==========================================================
+
+  if (
+    source === "ai"
+  ) {
+    try {
+      const baseBlob =
+        await fetchGeminiImageBytes(
+          cleanPrompt,
+          cleanTitle
+        );
+
+      /*
+       * NEVER upload Gemini base image directly.
+       */
+      const finalBlob =
+        await applyHeadlineOverlay(
+          baseBlob,
+          cleanTitle
+        );
+
+      return upload(
+        finalBlob,
+        "ai"
+      );
+    } catch (geminiError) {
+      const message =
+        geminiError instanceof Error
+          ? geminiError.message
+          : String(geminiError);
+
+      console.error(
+        `[IMAGE] Gemini FAILED: ${message}`
+      );
+
+      try {
+        const baseBlob =
+          await fetchStockImageBytes(
+            cleanPrompt
+          );
+
+        /*
+         * Pexels fallback ALSO receives
+         * the mandatory Sharp headline.
+         */
+        const finalBlob =
+          await applyHeadlineOverlay(
+            baseBlob,
+            cleanTitle
+          );
+
+        return upload(
+          finalBlob,
+          "stock"
+        );
+      } catch (pexelsError) {
+        const message2 =
+          pexelsError instanceof Error
+            ? pexelsError.message
+            : String(pexelsError);
+
+        console.error(
+          `[IMAGE] Pexels FALLBACK FAILED: ${message2}`
+        );
+
+        throw new Error(
+          `Image generation failed. Gemini: ${message}. Pexels: ${message2}`
+        );
+      }
+    }
+  }
+
+  // ==========================================================
+  // STOCK SOURCE
+  // Pexels -> Sharp -> upload
+  // Gemini fallback -> Sharp -> upload
+  // ==========================================================
+
+  try {
+    const baseBlob =
+      await fetchStockImageBytes(
+        cleanPrompt
+      );
+
+    const finalBlob =
+      await applyHeadlineOverlay(
+        baseBlob,
+        cleanTitle
+      );
+
+    return upload(
+      finalBlob,
+      "stock"
+    );
+  } catch (pexelsError) {
+    const message =
+      pexelsError instanceof Error
+        ? pexelsError.message
+        : String(pexelsError);
+
+    console.error(
+      `[IMAGE] Pexels FAILED: ${message}`
+    );
+
+    try {
+      const baseBlob =
+        await fetchGeminiImageBytes(
+          cleanPrompt,
+          cleanTitle
+        );
+
+      const finalBlob =
+        await applyHeadlineOverlay(
+          baseBlob,
+          cleanTitle
+        );
+
+      return upload(
+        finalBlob,
+        "ai"
+      );
+    } catch (geminiError) {
+      const message2 =
+        geminiError instanceof Error
+          ? geminiError.message
+          : String(geminiError);
+
+      console.error(
+        `[IMAGE] Gemini FALLBACK FAILED: ${message2}`
+      );
+
+      throw new Error(
+        `Image generation failed. Pexels: ${message}. Gemini: ${message2}`
+      );
+    }
+  }
+}
+
+// ============================================================
+// SUPABASE STORAGE
+// ============================================================
+
+async function upload(
+  blob: Blob,
+  source: ImageSource
+): Promise<{
+  url: string;
+  source: ImageSource;
+}> {
+  const db =
     supabaseAdmin();
 
-  const now = new Date();
+  /*
+   * generateImage() always returns JPEG after Sharp.
+   */
+  const extension =
+    "jpg";
 
-  const datePath = [
-    now.getUTCFullYear(),
-    String(
-      now.getUTCMonth() + 1
-    ).padStart(2, "0"),
-    String(
-      now.getUTCDate()
-    ).padStart(2, "0"),
-  ].join("-");
+  const date =
+    new Date()
+      .toISOString()
+      .slice(0, 10);
 
-  const filePath =
-    `${datePath}/${randomUUID()}.jpg`;
+  const path =
+    `${date}/${randomUUID()}.${extension}`;
+
+  const bytes =
+    new Uint8Array(
+      await blob.arrayBuffer()
+    );
+
+  if (bytes.length === 0) {
+    throw new Error(
+      "Cannot upload empty image."
+    );
+  }
+
+  console.info(
+    `[IMAGE] SUPABASE UPLOAD source=${source} path=${path} size=${bytes.length}`
+  );
 
   const {
     error,
-  } = await supabase.storage
-    .from(STORAGE_BUCKET)
-    .upload(
-      filePath,
-      image,
-      {
-        contentType: "image/jpeg",
-        cacheControl: "31536000",
-        upsert: false,
-      }
-    );
+  } =
+    await db.storage
+      .from(
+        STORAGE_BUCKET
+      )
+      .upload(
+        path,
+        bytes,
+        {
+          contentType:
+            "image/jpeg",
+
+          upsert: false,
+        }
+      );
 
   if (error) {
     throw new Error(
-      `Supabase image upload failed: ${error.message}`
+      `Supabase Storage upload failed: ${error.message}`
     );
   }
 
   const {
     data,
-  } = supabase.storage
-    .from(STORAGE_BUCKET)
-    .getPublicUrl(filePath);
+  } =
+    db.storage
+      .from(
+        STORAGE_BUCKET
+      )
+      .getPublicUrl(
+        path
+      );
 
-  if (!data.publicUrl) {
+  if (
+    !data?.publicUrl
+  ) {
     throw new Error(
-      "Supabase did not return a public image URL."
+      "Supabase did not return public image URL."
     );
   }
 
-  return data.publicUrl;
-}
-
-/**
- * ------------------------------------------------------------
- * MAIN GENERATOR
- * ------------------------------------------------------------
- */
-
-export async function generateImage(
-  prompt: string,
-  pref: ImageSourcePref,
-  title?: string
-): Promise<{
-  url: string;
-  source: ImageSource;
-}> {
-  if (!prompt?.trim()) {
-    throw new Error(
-      "Image prompt cannot be empty."
-    );
-  }
-
-  /**
-   * ----------------------------------------------------------
-   * AI FIRST
-   * ----------------------------------------------------------
-   */
-
-  if (pref === "ai") {
-    try {
-      console.log(
-        "[image] Generating image with Gemini..."
-      );
-
-      const source =
-        await generateWithGemini(
-          prompt,
-          title
-        );
-
-      console.log(
-        "[image] Gemini image received:",
-        source.length,
-        "bytes"
-      );
-
-      const finalImage =
-        await composeFinalImage(
-          source,
-          title
-        );
-
-      const url =
-        await uploadImage(
-          finalImage
-        );
-
-      console.log(
-        "[image] Gemini image uploaded:",
-        url
-      );
-
-      return {
-        url,
-        source: "ai",
-      };
-    } catch (error) {
-      console.error(
-        "[image] Gemini failed. Falling back to Pexels.",
-        error
-      );
-
-      /**
-       * Fallback to stock.
-       */
-      try {
-        const source =
-          await generateWithPexels(
-            prompt,
-            title
-          );
-
-        const finalImage =
-          await composeFinalImage(
-            source,
-            title
-          );
-
-        const url =
-          await uploadImage(
-            finalImage
-          );
-
-        return {
-          url,
-          source: "stock",
-        };
-      } catch (fallbackError) {
-        console.error(
-          "[image] Pexels fallback failed.",
-          fallbackError
-        );
-
-        throw new Error(
-          `Image generation failed. Gemini and Pexels both failed.`
-        );
-      }
-    }
-  }
-
-  /**
-   * ----------------------------------------------------------
-   * STOCK FIRST
-   * ----------------------------------------------------------
-   */
-
-  if (pref === "stock") {
-    try {
-      console.log(
-        "[image] Getting image from Pexels..."
-      );
-
-      const source =
-        await generateWithPexels(
-          prompt,
-          title
-        );
-
-      const finalImage =
-        await composeFinalImage(
-          source,
-          title
-        );
-
-      const url =
-        await uploadImage(
-          finalImage
-        );
-
-      console.log(
-        "[image] Pexels image uploaded:",
-        url
-      );
-
-      return {
-        url,
-        source: "stock",
-      };
-    } catch (error) {
-      console.error(
-        "[image] Pexels failed. Falling back to Gemini.",
-        error
-      );
-
-      try {
-        const source =
-          await generateWithGemini(
-            prompt,
-            title
-          );
-
-        const finalImage =
-          await composeFinalImage(
-            source,
-            title
-          );
-
-        const url =
-          await uploadImage(
-            finalImage
-          );
-
-        return {
-          url,
-          source: "ai",
-        };
-      } catch (fallbackError) {
-        console.error(
-          "[image] Gemini fallback failed.",
-          fallbackError
-        );
-
-        throw new Error(
-          "Image generation failed. Pexels and Gemini both failed."
-        );
-      }
-    }
-  }
-
-  /**
-   * ----------------------------------------------------------
-   * MIXED
-   * ----------------------------------------------------------
-   *
-   * Randomly chooses AI or stock.
-   */
-
-  const useAi =
-    Math.random() >= 0.5;
-
-  return generateImage(
-    prompt,
-    useAi ? "ai" : "stock",
-    title
+  console.info(
+    `[IMAGE] SUPABASE UPLOAD SUCCESS source=${source} url=${data.publicUrl}`
   );
+
+  return {
+    url:
+      data.publicUrl,
+
+    source,
+  };
 }
 
-/**
- * ------------------------------------------------------------
- * OPTIONAL DEFAULT EXPORT
- * ------------------------------------------------------------
- */
 
-export default generateImage;
+
+
+
+

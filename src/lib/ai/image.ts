@@ -50,6 +50,15 @@ const FINAL_HEIGHT = 1080;
 const HEADLINE_MAX_CHARS = 22;
 const HEADLINE_MAX_LINES = 4;
 
+/*
+ * Font file used for the headline overlay.
+ *
+ * Font ini di-embed langsung ke dalam SVG sebagai Base64
+ * via @font-face supaya librsvg (Sharp) TIDAK bergantung
+ * pada fontconfig sistem — yang sering gagal di Vercel.
+ */
+const HEADLINE_FONT_FILE = "DejaVuSans-Bold.ttf";
+
 // ============================================================
 // SHARP LOADER
 // ============================================================
@@ -67,6 +76,10 @@ async function getSharp(): Promise<
 
   /*
    * MUST happen before importing sharp/libvips.
+   *
+   * Meskipun kita sudah embed font via Base64 (yang jadi
+   * jalur utama), fontconfig tetap dikonfigurasi sebagai
+   * fallback dan untuk mencegah warning libvips.
    */
   configureServerlessFonts();
 
@@ -81,6 +94,7 @@ async function getSharp(): Promise<
 
 // ============================================================
 // SERVERLESS FONT CONFIG
+// (Fallback — jalur utama sekarang via Base64 @font-face)
 // ============================================================
 
 let fontConfigured = false;
@@ -103,7 +117,7 @@ function configureServerlessFonts(): void {
     const bundledFont =
       path.join(
         fontsDir,
-        "DejaVuSans-Bold.ttf"
+        HEADLINE_FONT_FILE
       );
 
     /*
@@ -156,23 +170,14 @@ function configureServerlessFonts(): void {
         bundledFont
       )
     ) {
-      /*
-       * FIX: Dulu cuma warning → sekarang error jelas supaya
-       * tidak silent failure ketika headline text tidak muncul.
-       */
-      console.error(
-        `[IMAGE] CRITICAL: Bundled font not found: ${bundledFont}. ` +
-          `Headline text may not render. Pastikan file ` +
-          `fonts/DejaVuSans-Bold.ttf ter-bundle di deployment.`
+      console.warn(
+        `[IMAGE] Bundled font not found: ${bundledFont}. ` +
+          `Base64 @font-face embedding will be used as fallback.`
       );
     }
 
     /*
      * Keep XML simple and absolute.
-     *
-     * FIX: Tambahkan alias tambahan (sans-serif, Arial) ke DejaVu Sans
-     * supaya librsvg selalu menemukan font fallback ketika
-     * "HeadlineFont" tidak ketemu.
      */
     const fontConfigXml =
       `<?xml version="1.0"?>` +
@@ -184,7 +189,6 @@ function configureServerlessFonts(): void {
       `<cachedir>${escapeXml(
         cacheDir
       )}</cachedir>` +
-      // Alias: HeadlineFont -> DejaVu Sans
       `<match target="pattern">` +
       `<test name="family">` +
       `<string>HeadlineFont</string>` +
@@ -193,7 +197,6 @@ function configureServerlessFonts(): void {
       `<string>DejaVu Sans</string>` +
       `</edit>` +
       `</match>` +
-      // Alias: Arial -> DejaVu Sans (banyak SVG pakai Arial)
       `<match target="pattern">` +
       `<test name="family">` +
       `<string>Arial</string>` +
@@ -202,7 +205,6 @@ function configureServerlessFonts(): void {
       `<string>DejaVu Sans</string>` +
       `</edit>` +
       `</match>` +
-      // Alias: Helvetica -> DejaVu Sans
       `<match target="pattern">` +
       `<test name="family">` +
       `<string>Helvetica</string>` +
@@ -249,16 +251,94 @@ function configureServerlessFonts(): void {
       )}`
     );
   } catch (error) {
-    /*
-     * Do not permanently mark configuration as successful
-     * when something failed.
-     */
     fontConfigured = false;
 
     console.warn(
       "[IMAGE] Fontconfig configuration failed:",
       error
     );
+  }
+}
+
+// ============================================================
+// FONT BASE64 LOADER (JALUR UTAMA UNTUK VERCEL)
+// ============================================================
+//
+// Membaca file TTF dan mengubahnya menjadi string Base64
+// yang akan di-embed langsung ke dalam SVG via @font-face.
+//
+// Dengan cara ini, librsvg TIDAK perlu mencari font di
+// sistem fontconfig — sehingga headline selalu dirender
+// dengan benar di lingkungan serverless seperti Vercel.
+// ============================================================
+
+let cachedFontBase64: string | null = null;
+let cachedFontError = false;
+
+function getFontBase64(): string {
+  if (cachedFontBase64 !== null) {
+    return cachedFontBase64;
+  }
+
+  if (cachedFontError) {
+    return "";
+  }
+
+  try {
+    const fontPath = path.join(
+      process.cwd(),
+      "fonts",
+      HEADLINE_FONT_FILE
+    );
+
+    console.info(
+      `[IMAGE] Attempting to load font from: ${fontPath}`
+    );
+
+    if (!fs.existsSync(fontPath)) {
+      console.error(
+        `[IMAGE] CRITICAL: Font file NOT FOUND at ${fontPath}. ` +
+          `Headline akan dirender tanpa font (tofu boxes). ` +
+          `Pastikan file fonts/${HEADLINE_FONT_FILE} ter-commit ` +
+          `ke Git dan outputFileTracingIncludes sudah benar ` +
+          `di next.config.js.`
+      );
+
+      cachedFontError = true;
+      cachedFontBase64 = "";
+      return "";
+    }
+
+    const fontBuffer =
+      fs.readFileSync(fontPath);
+
+    if (fontBuffer.length === 0) {
+      console.error(
+        `[IMAGE] CRITICAL: Font file at ${fontPath} is empty.`
+      );
+
+      cachedFontError = true;
+      cachedFontBase64 = "";
+      return "";
+    }
+
+    cachedFontBase64 =
+      fontBuffer.toString("base64");
+
+    console.info(
+      `[IMAGE] Font loaded as Base64 (raw=${fontBuffer.length} bytes, base64=${cachedFontBase64.length} chars)`
+    );
+
+    return cachedFontBase64;
+  } catch (error) {
+    console.error(
+      `[IMAGE] Failed to load font file:`,
+      error
+    );
+
+    cachedFontError = true;
+    cachedFontBase64 = "";
+    return "";
   }
 }
 
@@ -891,12 +971,6 @@ async function fetchGeminiImageBytes(
     `[IMAGE] Gemini starting model=${GEMINI_IMAGE_MODEL}`
   );
 
-  /*
-   * Gemini Interactions API.
-   *
-   * input can be an array of content blocks.
-   * response_format.type=image requests image output.
-   */
   const requestBody = {
     model:
       GEMINI_IMAGE_MODEL,
@@ -1275,9 +1349,6 @@ async function fetchStockImageBytes(
     );
   }
 
-  /*
-   * Randomize among the valid photos.
-   */
   const selected =
     validPhotos[
       Math.floor(
@@ -1339,12 +1410,6 @@ async function fetchStockImageBytes(
     );
   }
 
-  /*
-   * Some CDNs return application/octet-stream.
-   * Do not reject the image solely based on Content-Type.
-   *
-   * Sharp will validate the actual bytes later.
-   */
   console.info(
     `[IMAGE] Pexels SUCCESS size=${blob.size} type=${blob.type || "unknown"}`
   );
@@ -1403,15 +1468,7 @@ function cleanHeadline(
 }
 
 // ============================================================
-// HEADLINE WRAPPING (FIXED)
-// ============================================================
-//
-// Perubahan utama:
-// 1. Mendukung hingga 4 baris (sebelumnya 3).
-// 2. Jika melebihi batas, baris di-rebalance supaya panjang
-//    teks lebih merata (mencegah baris terakhir yang sangat
-//    panjang → overflow).
-// 3. Baris tidak pernah melebihi `maxChars`.
+// HEADLINE WRAPPING
 // ============================================================
 
 function wrapHeadline(
@@ -1436,9 +1493,6 @@ function wrapHeadline(
   let current = "";
 
   for (const word of words) {
-    /*
-     * Handle a single extremely long word.
-     */
     if (
       word.length >
         maxChars &&
@@ -1493,9 +1547,6 @@ function wrapHeadline(
     lines.push(current);
   }
 
-  /*
-   * Jika masih dalam batas → langsung pakai.
-   */
   if (
     lines.length <=
     HEADLINE_MAX_LINES
@@ -1504,11 +1555,7 @@ function wrapHeadline(
   }
 
   /*
-   * Rebalance: distribusikan kata ke dalam MAX_LINES baris
-   * supaya panjang tiap baris lebih merata.
-   *
-   * Ini mencegah baris terakhir yang sangat panjang
-   * yang bisa overflow keluar canvas.
+   * Rebalance jika melebihi batas baris.
    */
   const allWords =
     lines.join(" ").split(/\s+/);
@@ -1554,10 +1601,6 @@ function wrapHeadline(
     rebalanced.push(buf);
   }
 
-  /*
-   * Safety: jika masih lebih dari MAX_LINES (kasus ekstrem),
-   * potong ke MAX_LINES.
-   */
   return rebalanced.slice(
     0,
     HEADLINE_MAX_LINES
@@ -1670,17 +1713,16 @@ async function emojiDataUri(
 }
 
 // ============================================================
-// HEADLINE SVG (FIXED)
+// HEADLINE SVG (FIXED — BASE64 EMBEDDED FONT)
 // ============================================================
 //
-// Perubahan utama:
-// 1. `paint-order` ditambahkan sebagai ATTRIBUTE SVG (bukan
-//    hanya inline style). Ini penting untuk librsvg/Sharp.
-// 2. `font-family` diberi fallback chain panjang supaya
-//    selalu ada font yang bisa dipakai.
-// 3. Font size menyusut sesuai jumlah baris → mencegah overflow.
-// 4. Semua emoji di setiap baris di-render (bukan hanya yang
-//    terakhir).
+// Perubahan kunci:
+// 1. Font di-embed langsung ke dalam SVG via @font-face
+//    dengan data Base64. Ini memastikan teks SELALU dirender
+//    di Vercel tanpa bergantung pada fontconfig sistem.
+// 2. `paint-order` sebagai ATTRIBUTE SVG (bukan cuma style).
+// 3. Font size menyusut sesuai jumlah baris (78→48).
+// 4. Semua emoji di-render sebagai <image> Twemoji.
 // ============================================================
 
 async function createHeadlineSvg(
@@ -1709,9 +1751,6 @@ async function createHeadlineSvg(
     );
   }
 
-  /*
-   * Font size menyusut sesuai jumlah baris.
-   */
   const fontSize =
     lines.length === 1
       ? 78
@@ -1740,17 +1779,10 @@ async function createHeadlineSvg(
     FINAL_WIDTH / 2;
 
   /*
-   * Fallback font chain.
-   *
-   * Jika "HeadlineFont" gagal di-resolve fontconfig,
-   * librsvg akan mencoba DejaVu Sans → Arial → Helvetica →
-   * sans-serif.
-   *
-   * Karena kita sudah menambahkan alias di fontconfig,
-   * Arial & Helvetica juga akan di-map ke DejaVu Sans.
+   * Font family name — harus cocok dengan @font-face di bawah.
    */
   const fontFamily =
-    "HeadlineFont, DejaVu Sans, Arial, Helvetica, sans-serif";
+    "HeadlineFont";
 
   const lineElements =
     await Promise.all(
@@ -1764,9 +1796,6 @@ async function createHeadlineSvg(
             index *
               lineHeight;
 
-          /*
-           * Deteksi SEMUA emoji di baris ini.
-           */
           const matches =
             [
               ...line.matchAll(
@@ -1791,8 +1820,7 @@ async function createHeadlineSvg(
           }
 
           /*
-           * Buang semua emoji dari textPart supaya tidak
-           * dirender sebagai tofu.
+           * Buang semua emoji dari textPart.
            */
           let textPart = line;
 
@@ -1841,7 +1869,6 @@ async function createHeadlineSvg(
                 `stroke="#000000" ` +
                 `stroke-width="6" ` +
                 `stroke-linejoin="round" ` +
-                /* PENTING: paint-order sebagai ATTRIBUTE */
                 `paint-order="stroke fill" ` +
                 `style="paint-order: stroke fill;">` +
                 `${escapeXml(
@@ -1852,16 +1879,11 @@ async function createHeadlineSvg(
           }
 
           /*
-           * ===== EMOJI (sebagai <image> twemoji SVG) =====
+           * ===== EMOJI =====
            */
           if (
             emojiParts.length > 0
           ) {
-            /*
-             * Estimasi lebar teks (kasar).
-             * Tidak ada text metric presisi di sisi server,
-             * jadi kita pakai faktor 0.55.
-             */
             const estimatedTextWidth =
               Math.min(
                 textPart.length *
@@ -1953,12 +1975,33 @@ async function createHeadlineSvg(
     );
 
   /*
-   * Keep SVG deliberately simple.
+   * ===== FONT EMBEDDING via @font-face =====
    *
-   * No filters.
-   * No external fonts.
-   * No unsupported SVG features.
+   * Ini adalah kunci fix untuk Vercel. Font TTF di-embed
+   * sebagai Base64 data URI, sehingga librsvg dapat
+   * merender teks tanpa bergantung pada fontconfig sistem.
    */
+  const fontBase64 = getFontBase64();
+
+  const fontFaceStyle =
+    fontBase64.length > 0
+      ? `<style type="text/css"><![CDATA[` +
+        `@font-face{` +
+        `font-family:'HeadlineFont';` +
+        `src:url(data:font/truetype;charset=utf-8;base64,${fontBase64}) format('truetype');` +
+        `font-weight:bold;` +
+        `font-style:normal;` +
+        `}` +
+        `]]></style>`
+      : "";
+
+  if (!fontFaceStyle) {
+    console.error(
+      "[IMAGE] WARNING: Font Base64 tidak tersedia — headline mungkin " +
+        "akan dirender sebagai kotak kosong (tofu). Periksa log di atas."
+    );
+  }
+
   const svg =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<svg ` +
@@ -1967,6 +2010,7 @@ async function createHeadlineSvg(
     `width="${FINAL_WIDTH}" ` +
     `height="${FINAL_HEIGHT}" ` +
     `viewBox="0 0 ${FINAL_WIDTH} ${FINAL_HEIGHT}">` +
+    fontFaceStyle +
     lineElements.join(
       "\n"
     ) +
@@ -2016,9 +2060,6 @@ async function applyHeadlineOverlay(
   const sharp =
     await getSharp();
 
-  /*
-   * Validate source and create final 1080x1080 image.
-   */
   let baseImage: Buffer;
 
   try {
@@ -2062,20 +2103,11 @@ async function applyHeadlineOverlay(
     );
   }
 
-  /*
-   * Create headline SVG.
-   */
   const svgOverlay =
     await createHeadlineSvg(
       cleanTitle
     );
 
-  /*
-   * Verifikasi: SVG harus cukup besar dan mengandung <text>.
-   *
-   * Ini mencegah silent failure di mana headline
-   * tidak muncul di gambar.
-   */
   if (
     svgOverlay.length <
     200
@@ -2097,12 +2129,9 @@ async function applyHeadlineOverlay(
   }
 
   console.info(
-    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length} lines=${wrapHeadline(cleanTitle, HEADLINE_MAX_CHARS).length}`
+    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length} lines=${wrapHeadline(cleanTitle, HEADLINE_MAX_CHARS).length} fontEmbedded=${svgStr.includes("@font-face")}`
   );
 
-  /*
-   * Composite headline.
-   */
   let outputBuffer: Buffer;
 
   try {
@@ -2142,9 +2171,6 @@ async function applyHeadlineOverlay(
     );
   }
 
-  /*
-   * Verify final dimensions.
-   */
   const metadata =
     await sharp(
       outputBuffer
@@ -2165,12 +2191,6 @@ async function applyHeadlineOverlay(
     `[IMAGE] OVERLAY SUCCESS title="${cleanTitle}" width=${metadata.width} height=${metadata.height} bytes=${outputBuffer.length}`
   );
 
-  /*
-   * Buffer is already a valid Uint8Array.
-   *
-   * Using a Uint8Array avoids ArrayBuffer typing problems
-   * caused by Node's SharedArrayBuffer typings.
-   */
   return new Blob(
     [
       new Uint8Array(
@@ -2232,8 +2252,6 @@ export async function generateImage(
   /*
    * ==========================================================
    * AI FIRST
-   * Gemini -> Sharp -> Supabase
-   * Gemini failure -> Pexels -> Sharp -> Supabase
    * ==========================================================
    */
   if (
@@ -2312,8 +2330,6 @@ export async function generateImage(
   /*
    * ==========================================================
    * STOCK FIRST
-   * Pexels -> Sharp -> Supabase
-   * Pexels failure -> Gemini -> Sharp -> Supabase
    * ==========================================================
    */
   try {

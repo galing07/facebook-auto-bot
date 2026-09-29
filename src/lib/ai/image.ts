@@ -1150,39 +1150,54 @@ function wrapHeadline(
 // HEADLINE SVG
 // ============================================================
 
-async function createHeadlineSvg(
-  title: string
-): Promise<Buffer> {
+async function createHeadlineSvg(title: string): Promise<Buffer> {
   const cleanTitle = cleanHeadline(title);
-  if (!cleanTitle) throw new Error("Headline title is empty after cleaning.");
+  if (!cleanTitle) {
+    throw new Error("Headline title is empty after cleaning.");
+  }
 
   const lines = wrapHeadline(cleanTitle, 22);
-  if (lines.length === 0) throw new Error("Unable to create headline overlay.");
+  if (!lines.length) {
+    throw new Error("Unable to create headline overlay.");
+  }
 
-  const fontSize = lines.length === 1 ? 88 : lines.length === 2 ? 72 : 62;
+  const fontSize =
+    lines.length === 1 ? 82 :
+    lines.length === 2 ? 68 :
+    58;
+
   const lineHeight = fontSize + 18;
   const totalTextHeight = lines.length * lineHeight;
-  const firstTextY = FINAL_HEIGHT - totalTextHeight - 75;
+  const firstTextY =
+    FINAL_HEIGHT - totalTextHeight - 75;
 
   const twemojiBase =
     "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/";
 
   const emojiRegex =
-    /(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F|\u200D(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F)?)*|\uFE0F/gu;
+    /(?:[\\u{1F000}-\\u{1FAFF}]|[\\u{2600}-\\u{27BF}])(?:\\uFE0F|\\u200D(?:[\\u{1F000}-\\u{1FAFF}]|[\\u{2600}-\\u{27BF}])(?:\\uFE0F)?)*|\\uFE0F/gu;
 
   const emojiCache = new Map<string, string>();
 
-  async function emojiDataUri(emoji: string): Promise<string | null> {
-    const codePoint = twemoji.convert.toCodePoint(emoji).toLowerCase();
+  async function emojiDataUri(
+    emoji: string
+  ): Promise<string | null> {
+    const codePoint =
+      twemoji.convert
+        .toCodePoint(emoji)
+        .toLowerCase();
+
     if (!codePoint) return null;
 
-    const cached = emojiCache.get(codePoint);
+    const cached =
+      emojiCache.get(codePoint);
+
     if (cached) return cached;
 
-    const url = `${twemojiBase}${codePoint}.svg`;
-
     try {
-      const response = await fetch(url);
+      const response = await fetch(
+        `${twemojiBase}${codePoint}.svg`
+      );
 
       if (!response.ok) {
         console.warn(
@@ -1191,83 +1206,132 @@ async function createHeadlineSvg(
         return null;
       }
 
-      const svgText = await response.text();
+      const svgText =
+        await response.text();
 
       const dataUri =
-        `data:image/svg+xml;base64,${Buffer.from(svgText, "utf8").toString("base64")}`;
+        `data:image/svg+xml;base64,${Buffer.from(
+          svgText,
+          "utf8"
+        ).toString("base64")}`;
 
-      emojiCache.set(codePoint, dataUri);
+      emojiCache.set(
+        codePoint,
+        dataUri
+      );
+
       return dataUri;
     } catch (error) {
-      console.warn(`[IMAGE] Twemoji fetch failed for ${emoji}:`, error);
+      console.warn(
+        `[IMAGE] Twemoji fetch failed for ${emoji}:`,
+        error
+      );
       return null;
     }
   }
 
-  const lineElements = await Promise.all(
-    lines.map(async (line, index) => {
-      const y = firstTextY + index * lineHeight;
+  const lineElements =
+    await Promise.all(
+      lines.map(async (line, index) => {
+        const y =
+          firstTextY +
+          index * lineHeight;
 
-      const match = line.match(emojiRegex);
+        const matches =
+          [...line.matchAll(emojiRegex)];
 
-      let textPart = line;
-      let emojiPart: string | null = null;
+        // Use the final emoji in the line as the emoji suffix.
+        // The headline text itself remains untouched.
+        const emojiMatch =
+          matches.length > 0
+            ? matches[matches.length - 1]
+            : null;
 
-      if (match && match.index !== undefined) {
-        textPart = line.slice(0, match.index).trimEnd();
-        emojiPart = match[0];
-      }
+        const emojiPart =
+          emojiMatch?.[0] ?? null;
 
-      const upperText = textPart.toUpperCase();
+        const textPart =
+          emojiPart &&
+          emojiMatch?.index !== undefined
+            ? line
+                .slice(
+                  0,
+                  emojiMatch.index
+                )
+                .trimEnd()
+            : line;
 
-      // Conservative width estimate for DejaVu Sans.
-      // This intentionally leaves extra room before the emoji.
-      const textWidth =
-        upperText.length * fontSize * 0.66;
+        const upperText =
+          textPart.toUpperCase();
 
-      const emojiWidth = emojiPart
-        ? fontSize * 0.82
-        : 0;
+        /*
+         * IMPORTANT:
+         * The text is centered by SVG itself with text-anchor="middle".
+         * The width estimate is used ONLY to place the emoji after the
+         * centered text. It can never move the text itself.
+         */
+        const estimatedTextWidth =
+          upperText.length *
+          fontSize *
+          0.52;
 
-      // IMPORTANT:
-      // Emoji gets a fixed 28px gap from the final text glyph.
-      const emojiGap = emojiPart ? 36 : 0;
+        const emojiWidth =
+          emojiPart
+            ? fontSize * 0.82
+            : 0;
 
-      const totalWidth =
-        textWidth +
-        (emojiPart ? emojiGap + emojiWidth : 0);
+        const emojiGap =
+          emojiPart ? 28 : 0;
 
-      let x = 540 - totalWidth / 2;
+        const elements: string[] = [];
 
-      const elements: string[] = [];
-
-      if (upperText) {
-        const safeText = escapeXml(upperText);
-
-        elements.push(
-          `<text x="${x.toFixed(2)}" y="${y}" text-anchor="start" dominant-baseline="alphabetic" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fontSize}px" font-weight="900" fill="#FFFFFF" stroke="#000000" stroke-width="10" stroke-linejoin="round" paint-order="stroke">${safeText}</text>`
-        );
-
-        x += textWidth;
-      }
-
-      if (emojiPart) {
-        x += emojiGap;
-
-        const dataUri = await emojiDataUri(emojiPart);
-
-        if (dataUri) {
-          const emojiY = y - fontSize * 0.84;
-
+        if (upperText) {
           elements.push(
-            `<image x="${x.toFixed(2)}" y="${emojiY.toFixed(2)}" width="${emojiWidth.toFixed(2)}" height="${emojiWidth.toFixed(2)}" href="${dataUri}" preserveAspectRatio="xMidYMid meet" />`
+            `<text x="${FINAL_WIDTH / 2}" y="${y}" text-anchor="middle" dominant-baseline="alphabetic" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fontSize}px" font-weight="900" fill="#FFFFFF" stroke="#000000" stroke-width="10" stroke-linejoin="round" paint-order="stroke">${escapeXml(
+              upperText
+            )}</text>`
           );
         }
-      }
 
-      return `<g>${elements.join("\n")}</g>`;
-    })
-  );
+        if (emojiPart) {
+          const dataUri =
+            await emojiDataUri(
+              emojiPart
+            );
+
+          if (dataUri) {
+            /*
+             * Emoji is positioned relative to the estimated right edge
+             * of the centered text. Even if the estimate is imperfect,
+             * the text remains exactly centered.
+             */
+            const emojiX =
+              FINAL_WIDTH / 2 +
+              estimatedTextWidth / 2 +
+              emojiGap;
+
+            const emojiY =
+              y - fontSize * 0.84;
+
+            elements.push(
+              `<image x="${emojiX.toFixed(
+                2
+              )}" y="${emojiY.toFixed(
+                2
+              )}" width="${emojiWidth.toFixed(
+                2
+              )}" height="${emojiWidth.toFixed(
+                2
+              )}" href="${dataUri}" preserveAspectRatio="xMidYMid meet" />`
+            );
+          }
+        }
+
+        return `<g>${elements.join(
+          "\n"
+        )}</g>`;
+      })
+    );
 
   const svg = `
     <svg
@@ -1300,7 +1364,10 @@ async function createHeadlineSvg(
     </svg>
   `;
 
-  return Buffer.from(svg, "utf8");
+  return Buffer.from(
+    svg,
+    "utf8"
+  );
 }
 async function applyHeadlineOverlay(
   blob: Blob,

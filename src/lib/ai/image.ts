@@ -1,5 +1,8 @@
 import { randomUUID } from "crypto";
-import sharp from "sharp";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import twemoji from "@twemoji/api";
 
 import { env } from "@/lib/env";
@@ -9,6 +12,16 @@ import type {
   ImageSource,
   ImageSourcePref,
 } from "@/lib/types";
+
+/*
+ * IMPORTANT
+ * ------------------------------------------------------------
+ * Do NOT statically import sharp here.
+ *
+ * Fontconfig must be configured before libvips/Sharp attempts
+ * to render SVG text.
+ */
+import type sharpType from "sharp";
 
 const STORAGE_BUCKET = "post-images";
 
@@ -27,6 +40,203 @@ const PEXELS_TIMEOUT_MS = 20_000;
 
 const FINAL_WIDTH = 1080;
 const FINAL_HEIGHT = 1080;
+
+// ============================================================
+// SHARP LOADER
+// ============================================================
+
+let sharpInstance:
+  | typeof sharpType
+  | null = null;
+
+async function getSharp(): Promise<
+  typeof sharpType
+> {
+  if (sharpInstance) {
+    return sharpInstance;
+  }
+
+  /*
+   * Configure fonts BEFORE importing Sharp.
+   */
+  configureServerlessFonts();
+
+  const module =
+    await import("sharp");
+
+  sharpInstance =
+    module.default;
+
+  return sharpInstance;
+}
+
+// ============================================================
+// SERVERLESS FONT CONFIG
+// ============================================================
+
+let fontConfigured = false;
+
+function configureServerlessFonts(): void {
+  if (fontConfigured) {
+    return;
+  }
+
+  fontConfigured = true;
+
+  try {
+    const projectRoot =
+      process.cwd();
+
+    /*
+     * Expected repository structure:
+     *
+     * fonts/
+     *   DejaVuSans-Bold.ttf
+     *
+     * fontconfig/
+     *   fonts.conf
+     */
+    const fontsDir =
+      path.join(
+        projectRoot,
+        "fonts"
+      );
+
+    const bundledFont =
+      path.join(
+        fontsDir,
+        "DejaVuSans-Bold.ttf"
+      );
+
+    /*
+     * Vercel can use /tmp for fontconfig cache.
+     */
+    const cacheDir =
+      path.join(
+        os.tmpdir(),
+        "facebook-auto-bot-fontconfig"
+      );
+
+    const fontConfigDir =
+      path.join(
+        os.tmpdir(),
+        "facebook-auto-bot-fontconfig-config"
+      );
+
+    const fontsConf =
+      path.join(
+        fontConfigDir,
+        "fonts.conf"
+      );
+
+    fs.mkdirSync(
+      cacheDir,
+      {
+        recursive: true,
+      }
+    );
+
+    fs.mkdirSync(
+      fontConfigDir,
+      {
+        recursive: true,
+      }
+    );
+
+    if (
+      !fs.existsSync(
+        bundledFont
+      )
+    ) {
+      console.warn(
+        `[IMAGE] WARNING: bundled font not found: ${bundledFont}`
+      );
+
+      /*
+       * We still configure fontconfig.
+       * Linux system fonts may be available.
+       */
+    }
+
+    /*
+     * Generate an absolute fontconfig file.
+     *
+     * This avoids relying on the current working directory
+     * inside Vercel's serverless runtime.
+     */
+    const fontConfigXml =
+      `<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>${escapeXml(
+    fontsDir
+  )}</dir>
+
+  <cachedir>${escapeXml(
+    cacheDir
+  )}</cachedir>
+
+  <match target="pattern">
+    <test name="family">
+      <string>HeadlineFont</string>
+    </test>
+    <edit name="family" mode="prepend" binding="strong">
+      <string>DejaVu Sans</string>
+    </edit>
+  </match>
+
+  <match target="pattern">
+    <test name="family">
+      <string>DejaVu Sans</string>
+    </test>
+    <edit name="family" mode="prepend" binding="strong">
+      <string>DejaVu Sans</string>
+    </edit>
+  </match>
+</fontconfig>`;
+
+    fs.writeFileSync(
+      fontsConf,
+      fontConfigXml,
+      "utf8"
+    );
+
+    /*
+     * FONTCONFIG_PATH points to directory.
+     */
+    process.env.FONTCONFIG_PATH =
+      fontConfigDir;
+
+    /*
+     * FONTCONFIG_FILE can be an absolute config path.
+     */
+    process.env.FONTCONFIG_FILE =
+      fontsConf;
+
+    console.info(
+      `[IMAGE] Fontconfig configured`
+    );
+
+    console.info(
+      `[IMAGE] Font directory=${fontsDir}`
+    );
+
+    console.info(
+      `[IMAGE] Font config=${fontsConf}`
+    );
+
+    console.info(
+      `[IMAGE] Bundled font exists=${fs.existsSync(
+        bundledFont
+      )}`
+    );
+  } catch (error) {
+    console.warn(
+      "[IMAGE] Fontconfig configuration failed:",
+      error
+    );
+  }
+}
 
 // ============================================================
 // SOURCE RESOLUTION
@@ -75,8 +285,14 @@ function detectVisualCategory(
 } {
   const text = prompt
     .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(
+      /[^a-z0-9\s-]/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
     .trim();
 
   const rules: Array<{
@@ -314,22 +530,32 @@ function detectVisualCategory(
       rule.keywords.some(
         (keyword) =>
           text === keyword ||
-          text.includes(` ${keyword} `) ||
-          text.startsWith(`${keyword} `) ||
-          text.endsWith(` ${keyword}`)
+          text.includes(
+            ` ${keyword} `
+          ) ||
+          text.startsWith(
+            `${keyword} `
+          ) ||
+          text.endsWith(
+            ` ${keyword}`
+          )
       )
     ) {
       return {
-        category: rule.category,
-        subject: rule.subject,
-        keywords: rule.visual,
+        category:
+          rule.category,
+        subject:
+          rule.subject,
+        keywords:
+          rule.visual,
       };
     }
   }
 
   return {
     category: "GENERAL",
-    subject: "the topic provided",
+    subject:
+      "the topic provided",
     keywords:
       "a realistic scene directly representing the main subject and meaning of the topic, with the topic's primary object or activity clearly visible",
   };
@@ -553,7 +779,10 @@ function buildPexelsQuery(
     `[IMAGE] Visual category=${detected.category} Pexels query="${query}"`
   );
 
-  return query || categoryBase;
+  return (
+    query ||
+    categoryBase
+  );
 }
 
 // ============================================================
@@ -724,7 +953,9 @@ async function fetchGeminiImageBytes(
 
   for (const step of steps) {
     const content =
-      Array.isArray(step?.content)
+      Array.isArray(
+        step?.content
+      )
         ? step.content
         : [];
 
@@ -880,7 +1111,9 @@ async function fetchStockImageBytes(
   }
 
   const photos =
-    Array.isArray(data?.photos)
+    Array.isArray(
+      data?.photos
+    )
       ? data.photos
       : [];
 
@@ -1037,17 +1270,12 @@ function wrapHeadline(
     return [];
   }
 
-  const lines: string[] = [];
+  const lines: string[] =
+    [];
 
   let current = "";
 
   for (const word of words) {
-    /*
-     * Handle very long individual words.
-     *
-     * IMPORTANT:
-     * Never silently remove characters.
-     */
     if (
       word.length >
         maxChars &&
@@ -1109,12 +1337,9 @@ function wrapHeadline(
   }
 
   /*
-   * Maximum three lines.
+   * Maximum 3 lines.
    *
-   * If there are more than three,
-   * combine everything remaining into
-   * the third line rather than deleting
-   * the last characters.
+   * Never delete headline characters.
    */
   if (lines.length <= 3) {
     return lines;
@@ -1158,51 +1383,70 @@ async function createHeadlineSvg(
   }
 
   /*
-   * Conservative font sizes prevent clipping.
+   * Font sizes.
    */
   const fontSize =
     lines.length === 1
-      ? 78
+      ? 76
       : lines.length === 2
-        ? 66
-        : 56;
+        ? 64
+        : 54;
 
   const lineHeight =
-    fontSize + 20;
+    fontSize + 18;
 
   const totalTextHeight =
     lines.length *
     lineHeight;
 
+  const bottomMargin =
+    75;
+
   const firstTextY =
     FINAL_HEIGHT -
     totalTextHeight -
-    75;
+    bottomMargin;
 
   const CENTER_X =
     FINAL_WIDTH / 2;
 
+  /*
+   * IMPORTANT
+   *
+   * This family is mapped through our bundled
+   * DejaVu font + fontconfig.
+   *
+   * Do NOT use Arial.
+   */
+  const FONT_FAMILY =
+    "HeadlineFont";
+
+  // ----------------------------------------------------------
+  // TWEMOJI
+  // ----------------------------------------------------------
+
   const twemojiBase =
     "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/";
 
-  /*
-   * REAL Unicode emoji regex.
-   *
-   * IMPORTANT:
-   * Use \u, NOT \\u.
-   */
   const emojiRegex =
     /(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F|\u200D(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F)?)*|\uFE0F/gu;
 
   const emojiCache =
-    new Map<string, string>();
+    new Map<
+      string,
+      string
+    >();
 
   async function emojiDataUri(
     emoji: string
-  ): Promise<string | null> {
+  ): Promise<
+    string | null
+  > {
     const codePoint =
       twemoji.convert
-        .toCodePoint(emoji)
+        .toCodePoint(
+          emoji
+        )
         .toLowerCase();
 
     if (!codePoint) {
@@ -1221,12 +1465,18 @@ async function createHeadlineSvg(
     try {
       const response =
         await fetch(
-          `${twemojiBase}${codePoint}.svg`
+          `${twemojiBase}${codePoint}.svg`,
+          {
+            signal:
+              AbortSignal.timeout(
+                10_000
+              ),
+          }
         );
 
       if (!response.ok) {
         console.warn(
-          `[IMAGE] Twemoji HTTP ${response.status} for ${emoji} (${codePoint})`
+          `[IMAGE] Twemoji HTTP ${response.status} for ${emoji}`
         );
 
         return null;
@@ -1239,7 +1489,9 @@ async function createHeadlineSvg(
         `data:image/svg+xml;base64,${Buffer.from(
           svgText,
           "utf8"
-        ).toString("base64")}`;
+        ).toString(
+          "base64"
+        )}`;
 
       emojiCache.set(
         codePoint,
@@ -1257,6 +1509,10 @@ async function createHeadlineSvg(
     }
   }
 
+  // ----------------------------------------------------------
+  // TEXT ELEMENTS
+  // ----------------------------------------------------------
+
   const lineElements =
     await Promise.all(
       lines.map(
@@ -1266,11 +1522,9 @@ async function createHeadlineSvg(
         ) => {
           const y =
             firstTextY +
-            index * lineHeight;
+            index *
+              lineHeight;
 
-          /*
-           * Find the final emoji in this line.
-           */
           const matches =
             [
               ...line.matchAll(
@@ -1291,11 +1545,6 @@ async function createHeadlineSvg(
               ? lastMatch[0]
               : null;
 
-          /*
-           * Keep ALL non-emoji text exactly as supplied.
-           *
-           * No toUpperCase().
-           */
           const textPart =
             emojiPart &&
             lastMatch?.index !==
@@ -1308,42 +1557,36 @@ async function createHeadlineSvg(
                   .trimEnd()
               : line;
 
-          const exactText =
-            textPart;
-
-          /*
-           * SVG itself performs the centering.
-           *
-           * x=540 + text-anchor="middle"
-           *
-           * Therefore emoji calculation cannot move
-           * the headline.
-           */
-          const estimatedTextWidth =
-            exactText.length *
-            fontSize *
-            0.48;
-
-          const emojiWidth =
-            emojiPart
-              ? fontSize * 0.82
-              : 0;
-
-          const emojiGap =
-            emojiPart
-              ? 18
-              : 0;
-
           const elements: string[] =
             [];
 
-          if (exactText) {
+          // --------------------------------------------------
+          // HEADLINE TEXT
+          // --------------------------------------------------
+
+          if (textPart) {
             elements.push(
-              `<text x="${CENTER_X}" y="${y}" text-anchor="middle" dominant-baseline="alphabetic" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fontSize}px" font-weight="900" fill="#FFFFFF" stroke="#000000" stroke-width="10" stroke-linejoin="round" paint-order="stroke">${escapeXml(
-                exactText
+              `<text
+                x="${CENTER_X}"
+                y="${y}"
+                text-anchor="middle"
+                font-family="${FONT_FAMILY}"
+                font-size="${fontSize}px"
+                font-weight="700"
+                fill="#FFFFFF"
+                stroke="#000000"
+                stroke-width="8"
+                stroke-linejoin="round"
+                style="paint-order:stroke fill"
+              >${escapeXml(
+                textPart
               )}</text>`
             );
           }
+
+          // --------------------------------------------------
+          // EMOJI
+          // --------------------------------------------------
 
           if (emojiPart) {
             const dataUri =
@@ -1352,9 +1595,22 @@ async function createHeadlineSvg(
               );
 
             if (dataUri) {
-              /*
-               * Put emoji immediately after the centered text.
-               */
+              const estimatedTextWidth =
+                Math.min(
+                  textPart.length *
+                    fontSize *
+                    0.52,
+                  FINAL_WIDTH -
+                    160
+                );
+
+              const emojiWidth =
+                fontSize *
+                0.82;
+
+              const emojiGap =
+                16;
+
               let emojiX =
                 CENTER_X +
                 estimatedTextWidth /
@@ -1362,11 +1618,8 @@ async function createHeadlineSvg(
                 emojiGap;
 
               const rightPadding =
-                45;
+                50;
 
-              /*
-               * Never let emoji leave the canvas.
-               */
               if (
                 emojiX +
                   emojiWidth >
@@ -1393,15 +1646,22 @@ async function createHeadlineSvg(
                   0.84;
 
               elements.push(
-                `<image x="${emojiX.toFixed(
-                  2
-                )}" y="${emojiY.toFixed(
-                  2
-                )}" width="${emojiWidth.toFixed(
-                  2
-                )}" height="${emojiWidth.toFixed(
-                  2
-                )}" href="${dataUri}" preserveAspectRatio="xMidYMid meet" />`
+                `<image
+                  x="${emojiX.toFixed(
+                    2
+                  )}"
+                  y="${emojiY.toFixed(
+                    2
+                  )}"
+                  width="${emojiWidth.toFixed(
+                    2
+                  )}"
+                  height="${emojiWidth.toFixed(
+                    2
+                  )}"
+                  href="${dataUri}"
+                  preserveAspectRatio="xMidYMid meet"
+                />`
               );
             }
           }
@@ -1413,36 +1673,27 @@ async function createHeadlineSvg(
       )
     );
 
-  const svg = `
-    <svg
-      width="${FINAL_WIDTH}"
-      height="${FINAL_HEIGHT}"
-      viewBox="0 0 ${FINAL_WIDTH} ${FINAL_HEIGHT}"
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <defs>
-        <filter
-          id="headlineShadow"
-          x="-20%"
-          y="-20%"
-          width="140%"
-          height="140%"
-        >
-          <feDropShadow
-            dx="0"
-            dy="4"
-            stdDeviation="4"
-            flood-color="#000000"
-            flood-opacity="0.85"
-          />
-        </filter>
-      </defs>
-
-      <g filter="url(#headlineShadow)">
-        ${lineElements.join("\n")}
-      </g>
-    </svg>
-  `;
+  /*
+   * IMPORTANT:
+   *
+   * Keep SVG simple.
+   *
+   * No SVG filters.
+   * No external fonts.
+   * No Arial.
+   * No unsupported SVG font declarations.
+   */
+  const svg =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<svg ` +
+    `xmlns="http://www.w3.org/2000/svg" ` +
+    `width="${FINAL_WIDTH}" ` +
+    `height="${FINAL_HEIGHT}" ` +
+    `viewBox="0 0 ${FINAL_WIDTH} ${FINAL_HEIGHT}">` +
+    lineElements.join(
+      "\n"
+    ) +
+    `</svg>`;
 
   return Buffer.from(
     svg,
@@ -1488,6 +1739,13 @@ async function applyHeadlineOverlay(
     );
   }
 
+  const sharp =
+    await getSharp();
+
+  // ----------------------------------------------------------
+  // BASE IMAGE
+  // ----------------------------------------------------------
+
   const baseImage =
     await sharp(
       inputBuffer
@@ -1514,10 +1772,30 @@ async function applyHeadlineOverlay(
     );
   }
 
+  // ----------------------------------------------------------
+  // HEADLINE SVG
+  // ----------------------------------------------------------
+
   const svgOverlay =
     await createHeadlineSvg(
       cleanTitle
     );
+
+  console.info(
+    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length}`
+  );
+
+  if (
+    svgOverlay.length < 100
+  ) {
+    throw new Error(
+      "Headline SVG was unexpectedly empty."
+    );
+  }
+
+  // ----------------------------------------------------------
+  // COMPOSITE
+  // ----------------------------------------------------------
 
   const outputBuffer =
     await sharp(
@@ -1544,6 +1822,10 @@ async function applyHeadlineOverlay(
       "Headline overlay produced an empty image."
     );
   }
+
+  // ----------------------------------------------------------
+  // VERIFY FINAL IMAGE
+  // ----------------------------------------------------------
 
   const metadata =
     await sharp(
@@ -1583,7 +1865,8 @@ async function applyHeadlineOverlay(
       ) as ArrayBuffer,
     ],
     {
-      type: "image/jpeg",
+      type:
+        "image/jpeg",
     }
   );
 }
@@ -1659,9 +1942,12 @@ export async function generateImage(
         finalBlob,
         "ai"
       );
-    } catch (geminiError) {
+    } catch (
+      geminiError
+    ) {
       const message =
-        geminiError instanceof Error
+        geminiError instanceof
+          Error
           ? geminiError.message
           : String(
               geminiError
@@ -1687,9 +1973,12 @@ export async function generateImage(
           finalBlob,
           "stock"
         );
-      } catch (pexelsError) {
+      } catch (
+        pexelsError
+      ) {
         const message2 =
-          pexelsError instanceof Error
+          pexelsError instanceof
+            Error
             ? pexelsError.message
             : String(
                 pexelsError
@@ -1728,9 +2017,12 @@ export async function generateImage(
       finalBlob,
       "stock"
     );
-  } catch (pexelsError) {
+  } catch (
+    pexelsError
+  ) {
     const message =
-      pexelsError instanceof Error
+      pexelsError instanceof
+        Error
         ? pexelsError.message
         : String(
             pexelsError
@@ -1757,9 +2049,12 @@ export async function generateImage(
         finalBlob,
         "ai"
       );
-    } catch (geminiError) {
+    } catch (
+      geminiError
+    ) {
       const message2 =
-        geminiError instanceof Error
+        geminiError instanceof
+          Error
           ? geminiError.message
           : String(
               geminiError
@@ -1868,4 +2163,3 @@ async function upload(
     source,
   };
 }
-

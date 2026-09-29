@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,12 +16,18 @@ import type {
 /*
  * IMPORTANT
  * ------------------------------------------------------------
- * Do NOT statically import sharp here.
+ * Do NOT statically import sharp.
  *
- * Fontconfig must be configured before libvips/Sharp attempts
- * to render SVG text.
+ * Fontconfig must be configured before libvips/Sharp is loaded.
+ *
+ * This file must run in Node.js runtime.
  */
+
 import type sharpType from "sharp";
+
+// ============================================================
+// CONSTANTS
+// ============================================================
 
 const STORAGE_BUCKET = "post-images";
 
@@ -33,10 +39,7 @@ const GEMINI_IMAGE_ENDPOINT =
 
 const GEMINI_TIMEOUT_MS = 90_000;
 const PEXELS_TIMEOUT_MS = 20_000;
-
-// ============================================================
-// FINAL IMAGE
-// ============================================================
+const TWEMOJI_TIMEOUT_MS = 10_000;
 
 const FINAL_WIDTH = 1080;
 const FINAL_HEIGHT = 1080;
@@ -57,7 +60,7 @@ async function getSharp(): Promise<
   }
 
   /*
-   * Configure fonts BEFORE importing Sharp.
+   * MUST happen before importing sharp/libvips.
    */
   configureServerlessFonts();
 
@@ -81,21 +84,10 @@ function configureServerlessFonts(): void {
     return;
   }
 
-  fontConfigured = true;
-
   try {
     const projectRoot =
       process.cwd();
 
-    /*
-     * Expected repository structure:
-     *
-     * fonts/
-     *   DejaVuSans-Bold.ttf
-     *
-     * fontconfig/
-     *   fonts.conf
-     */
     const fontsDir =
       path.join(
         projectRoot,
@@ -109,7 +101,7 @@ function configureServerlessFonts(): void {
       );
 
     /*
-     * Vercel can use /tmp for fontconfig cache.
+     * Vercel/serverless writable directory.
      */
     const cacheDir =
       path.join(
@@ -145,55 +137,46 @@ function configureServerlessFonts(): void {
 
     if (
       !fs.existsSync(
+        fontsDir
+      )
+    ) {
+      console.warn(
+        `[IMAGE] Fonts directory not found: ${fontsDir}`
+      );
+    }
+
+    if (
+      !fs.existsSync(
         bundledFont
       )
     ) {
       console.warn(
-        `[IMAGE] WARNING: bundled font not found: ${bundledFont}`
+        `[IMAGE] Bundled font not found: ${bundledFont}`
       );
-
-      /*
-       * We still configure fontconfig.
-       * Linux system fonts may be available.
-       */
     }
 
     /*
-     * Generate an absolute fontconfig file.
-     *
-     * This avoids relying on the current working directory
-     * inside Vercel's serverless runtime.
+     * Keep XML simple and absolute.
      */
     const fontConfigXml =
-      `<?xml version="1.0"?>
-<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
-<fontconfig>
-  <dir>${escapeXml(
-    fontsDir
-  )}</dir>
-
-  <cachedir>${escapeXml(
-    cacheDir
-  )}</cachedir>
-
-  <match target="pattern">
-    <test name="family">
-      <string>HeadlineFont</string>
-    </test>
-    <edit name="family" mode="prepend" binding="strong">
-      <string>DejaVu Sans</string>
-    </edit>
-  </match>
-
-  <match target="pattern">
-    <test name="family">
-      <string>DejaVu Sans</string>
-    </test>
-    <edit name="family" mode="prepend" binding="strong">
-      <string>DejaVu Sans</string>
-    </edit>
-  </match>
-</fontconfig>`;
+      `<?xml version="1.0"?>` +
+      `<!DOCTYPE fontconfig SYSTEM "fonts.dtd">` +
+      `<fontconfig>` +
+      `<dir>${escapeXml(
+        fontsDir
+      )}</dir>` +
+      `<cachedir>${escapeXml(
+        cacheDir
+      )}</cachedir>` +
+      `<match target="pattern">` +
+      `<test name="family">` +
+      `<string>HeadlineFont</string>` +
+      `</test>` +
+      `<edit name="family" mode="prepend" binding="strong">` +
+      `<string>DejaVu Sans</string>` +
+      `</edit>` +
+      `</match>` +
+      `</fontconfig>`;
 
     fs.writeFileSync(
       fontsConf,
@@ -202,16 +185,16 @@ function configureServerlessFonts(): void {
     );
 
     /*
-     * FONTCONFIG_PATH points to directory.
+     * These variables need to exist before libvips/fontconfig
+     * starts resolving fonts.
      */
     process.env.FONTCONFIG_PATH =
       fontConfigDir;
 
-    /*
-     * FONTCONFIG_FILE can be an absolute config path.
-     */
     process.env.FONTCONFIG_FILE =
       fontsConf;
+
+    fontConfigured = true;
 
     console.info(
       `[IMAGE] Fontconfig configured`
@@ -231,6 +214,12 @@ function configureServerlessFonts(): void {
       )}`
     );
   } catch (error) {
+    /*
+     * Do not permanently mark configuration as successful
+     * when something failed.
+     */
+    fontConfigured = false;
+
     console.warn(
       "[IMAGE] Fontconfig configuration failed:",
       error
@@ -255,7 +244,7 @@ export function resolveImageSource(
 }
 
 // ============================================================
-// GEMINI PROMPT
+// VISUAL STYLE
 // ============================================================
 
 const PHOTO_STYLE = [
@@ -276,24 +265,31 @@ const PHOTO_STYLE = [
   "no grid",
 ].join(", ");
 
-function detectVisualCategory(
-  prompt: string
-): {
+// ============================================================
+// VISUAL CATEGORY DETECTION
+// ============================================================
+
+type VisualDetection = {
   category: string;
   subject: string;
   keywords: string;
-} {
-  const text = prompt
-    .toLowerCase()
-    .replace(
-      /[^a-z0-9\s-]/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim();
+};
+
+function detectVisualCategory(
+  prompt: string
+): VisualDetection {
+  const text =
+    prompt
+      .toLowerCase()
+      .replace(
+        /[^a-z0-9\s-]/g,
+        " "
+      )
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
 
   const rules: Array<{
     category: string;
@@ -525,30 +521,52 @@ function detectVisualCategory(
     },
   ];
 
-  for (const rule of rules) {
-    if (
-      rule.keywords.some(
-        (keyword) =>
-          text === keyword ||
-          text.includes(
-            ` ${keyword} `
-          ) ||
-          text.startsWith(
-            `${keyword} `
-          ) ||
-          text.endsWith(
-            ` ${keyword}`
-          )
-      )
-    ) {
-      return {
-        category:
-          rule.category,
-        subject:
-          rule.subject,
-        keywords:
-          rule.visual,
-      };
+  /*
+   * Sort longest keyword first.
+   *
+   * Example:
+   * "street food" should be tested before "food".
+   */
+  const sortedRules =
+    rules.map(
+      (rule) => ({
+        ...rule,
+        keywords: [
+          ...rule.keywords,
+        ].sort(
+          (a, b) =>
+            b.length -
+            a.length
+        ),
+      })
+    );
+
+  for (const rule of sortedRules) {
+    for (const keyword of rule.keywords) {
+      const escaped =
+        keyword.replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        );
+
+      const regex =
+        new RegExp(
+          `(^|\\s)${escaped}(?=\\s|$)`,
+          "i"
+        );
+
+      if (
+        regex.test(text)
+      ) {
+        return {
+          category:
+            rule.category,
+          subject:
+            rule.subject,
+          keywords:
+            rule.visual,
+        };
+      }
     }
   }
 
@@ -560,6 +578,10 @@ function detectVisualCategory(
       "a realistic scene directly representing the main subject and meaning of the topic, with the topic's primary object or activity clearly visible",
   };
 }
+
+// ============================================================
+// GEMINI PROMPT
+// ============================================================
 
 function buildVisualPrompt(
   prompt: string
@@ -590,15 +612,12 @@ function buildGeminiPrompt(
   prompt: string,
   _title: string
 ): string {
-  const visualPrompt =
-    buildVisualPrompt(
-      prompt
-    );
-
   return [
     "Create a high-quality square social media photograph.",
     "",
-    visualPrompt,
+    buildVisualPrompt(
+      prompt
+    ),
     "",
     "IMPORTANT:",
     "- The TOPIC controls the visual subject.",
@@ -625,7 +644,7 @@ function buildGeminiPrompt(
 }
 
 // ============================================================
-// PEXELS SEARCH QUERY
+// PEXELS QUERY
 // ============================================================
 
 function buildPexelsQuery(
@@ -789,6 +808,22 @@ function buildPexelsQuery(
 // GEMINI IMAGE GENERATION
 // ============================================================
 
+type GeminiImageResponse = {
+  output_image?: {
+    data?: string;
+    mime_type?: string;
+  };
+
+  steps?: Array<{
+    type?: string;
+    content?: Array<{
+      type?: string;
+      data?: string;
+      mime_type?: string;
+    }>;
+  }>;
+};
+
 async function fetchGeminiImageBytes(
   prompt: string,
   title: string
@@ -798,12 +833,12 @@ async function fetchGeminiImageBytes(
 
   if (!apiKey) {
     throw new Error(
-      "GEMINI_API_KEY is not configured"
+      "GEMINI_API_KEY is not configured."
     );
   }
 
   const cleanTitle =
-    title.trim();
+    cleanHeadline(title);
 
   if (!cleanTitle) {
     throw new Error(
@@ -821,10 +856,12 @@ async function fetchGeminiImageBytes(
     `[IMAGE] Gemini starting model=${GEMINI_IMAGE_MODEL}`
   );
 
-  console.info(
-    `[IMAGE] Gemini headline="${cleanTitle}"`
-  );
-
+  /*
+   * Gemini Interactions API.
+   *
+   * input can be an array of content blocks.
+   * response_format.type=image requests image output.
+   */
   const requestBody = {
     model:
       GEMINI_IMAGE_MODEL,
@@ -844,31 +881,45 @@ async function fetchGeminiImageBytes(
     },
   };
 
-  const response =
-    await fetch(
-      GEMINI_IMAGE_ENDPOINT,
-      {
-        method: "POST",
+  let response: Response;
 
-        headers: {
-          "Content-Type":
-            "application/json",
+  try {
+    response =
+      await fetch(
+        GEMINI_IMAGE_ENDPOINT,
+        {
+          method: "POST",
 
-          "x-goog-api-key":
-            apiKey,
-        },
+          headers: {
+            "Content-Type":
+              "application/json",
+            "x-goog-api-key":
+              apiKey,
+          },
 
-        body:
-          JSON.stringify(
-            requestBody
-          ),
+          body:
+            JSON.stringify(
+              requestBody
+            ),
 
-        signal:
-          AbortSignal.timeout(
-            GEMINI_TIMEOUT_MS
-          ),
-      }
-    );
+          signal:
+            AbortSignal.timeout(
+              GEMINI_TIMEOUT_MS
+            ),
+        }
+      );
+  } catch (error) {
+    if (
+      error instanceof
+      DOMException
+    ) {
+      throw new Error(
+        "Gemini image request timed out."
+      );
+    }
+
+    throw error;
+  }
 
   const body =
     await response.text();
@@ -880,22 +931,26 @@ async function fetchGeminiImageBytes(
   if (!response.ok) {
     console.error(
       "[IMAGE] Gemini API error:",
-      body.slice(0, 1500)
+      body.slice(0, 2000)
     );
 
     throw new Error(
       `Gemini image API HTTP ${response.status}: ${body.slice(
         0,
-        500
+        800
       )}`
     );
   }
 
-  let data: any;
+  let data:
+    | GeminiImageResponse
+    | null = null;
 
   try {
     data =
-      JSON.parse(body);
+      JSON.parse(
+        body
+      ) as GeminiImageResponse;
   } catch {
     console.error(
       "[IMAGE] Gemini returned non-JSON:",
@@ -903,34 +958,39 @@ async function fetchGeminiImageBytes(
     );
 
     throw new Error(
-      "Gemini returned invalid JSON"
+      "Gemini returned invalid JSON."
     );
   }
 
-  const outputImage =
-    data?.output_image;
-
+  /*
+   * Primary documented response.
+   */
   if (
-    outputImage &&
-    typeof outputImage.data ===
+    typeof data?.output_image
+      ?.data ===
       "string" &&
-    outputImage.data.length > 0
+    data.output_image.data.length >
+      0
   ) {
     const mimeType =
-      typeof outputImage.mime_type ===
+      typeof data.output_image
+        .mime_type ===
       "string"
-        ? outputImage.mime_type
+        ? data.output_image
+            .mime_type
         : "image/jpeg";
 
     const bytes =
       Buffer.from(
-        outputImage.data,
+        data.output_image.data,
         "base64"
       );
 
-    if (bytes.length === 0) {
+    if (
+      bytes.length === 0
+    ) {
       throw new Error(
-        "Gemini returned empty image data"
+        "Gemini returned empty image data."
       );
     }
 
@@ -946,31 +1006,38 @@ async function fetchGeminiImageBytes(
     );
   }
 
-  const steps =
-    Array.isArray(data?.steps)
-      ? data.steps
-      : [];
-
-  for (const step of steps) {
-    const content =
-      Array.isArray(
-        step?.content
-      )
-        ? step.content
-        : [];
-
-    for (const item of content) {
+  /*
+   * Compatibility fallback for model-output steps.
+   */
+  if (
+    Array.isArray(
+      data?.steps
+    )
+  ) {
+    for (const step of data.steps) {
       if (
-        item?.type === "image" &&
-        typeof item?.data ===
-          "string" &&
-        item.data.length > 0
+        !Array.isArray(
+          step?.content
+        )
       ) {
-        const mimeType =
-          typeof item.mime_type ===
-          "string"
-            ? item.mime_type
-            : "image/jpeg";
+        continue;
+      }
+
+      for (const item of step.content) {
+        if (
+          item?.type !==
+          "image"
+        ) {
+          continue;
+        }
+
+        if (
+          typeof item.data !==
+          "string" ||
+          !item.data
+        ) {
+          continue;
+        }
 
         const bytes =
           Buffer.from(
@@ -978,9 +1045,17 @@ async function fetchGeminiImageBytes(
             "base64"
           );
 
-        if (bytes.length === 0) {
+        if (
+          bytes.length === 0
+        ) {
           continue;
         }
+
+        const mimeType =
+          typeof item.mime_type ===
+          "string"
+            ? item.mime_type
+            : "image/jpeg";
 
         console.info(
           `[IMAGE] Gemini SUCCESS steps image bytes=${bytes.length}`
@@ -1002,17 +1077,31 @@ async function fetchGeminiImageBytes(
 
   console.error(
     "[IMAGE] Gemini response keys:",
-    Object.keys(data ?? {})
+    Object.keys(
+      data ?? {}
+    )
   );
 
   throw new Error(
-    "Gemini completed but returned no image data"
+    "Gemini completed but returned no image data."
   );
 }
 
 // ============================================================
 // PEXELS
 // ============================================================
+
+type PexelsPhoto = {
+  src?: {
+    large2x?: string;
+    large?: string;
+    original?: string;
+  };
+};
+
+type PexelsResponse = {
+  photos?: PexelsPhoto[];
+};
 
 async function fetchStockImageBytes(
   prompt: string
@@ -1022,7 +1111,7 @@ async function fetchStockImageBytes(
 
   if (!apiKey) {
     throw new Error(
-      "PEXELS_API_KEY is not configured"
+      "PEXELS_API_KEY is not configured."
     );
   }
 
@@ -1099,14 +1188,18 @@ async function fetchStockImageBytes(
     );
   }
 
-  let data: any;
+  let data:
+    | PexelsResponse
+    | null = null;
 
   try {
     data =
-      JSON.parse(body);
+      JSON.parse(
+        body
+      ) as PexelsResponse;
   } catch {
     throw new Error(
-      "Pexels returned invalid JSON"
+      "Pexels returned invalid JSON."
     );
   }
 
@@ -1117,18 +1210,25 @@ async function fetchStockImageBytes(
       ? data.photos
       : [];
 
-  if (photos.length === 0) {
+  if (
+    photos.length === 0
+  ) {
     throw new Error(
-      `Pexels returned no photos for query "${query}"`
+      `Pexels returned no photos for query "${query}".`
     );
   }
 
   const validPhotos =
     photos.filter(
-      (photo: any) =>
-        typeof photo?.src?.large2x ===
+      (photo) =>
+        typeof photo?.src
+          ?.large2x ===
           "string" ||
-        typeof photo?.src?.large ===
+        typeof photo?.src
+          ?.large ===
+          "string" ||
+        typeof photo?.src
+          ?.original ===
           "string"
     );
 
@@ -1136,10 +1236,13 @@ async function fetchStockImageBytes(
     validPhotos.length === 0
   ) {
     throw new Error(
-      "Pexels returned photos without usable URLs"
+      "Pexels returned photos without usable URLs."
     );
   }
 
+  /*
+   * Randomize among the valid photos.
+   */
   const selected =
     validPhotos[
       Math.floor(
@@ -1148,9 +1251,22 @@ async function fetchStockImageBytes(
       )
     ];
 
+  if (!selected) {
+    throw new Error(
+      "Unable to select a Pexels photo."
+    );
+  }
+
   const imageUrl =
-    selected.src.large2x ??
-    selected.src.large;
+    selected.src?.large2x ??
+    selected.src?.large ??
+    selected.src?.original;
+
+  if (!imageUrl) {
+    throw new Error(
+      "Selected Pexels photo has no usable image URL."
+    );
+  }
 
   console.info(
     "[IMAGE] Pexels downloading selected photo"
@@ -1169,7 +1285,9 @@ async function fetchStockImageBytes(
       }
     );
 
-  if (!imageResponse.ok) {
+  if (
+    !imageResponse.ok
+  ) {
     throw new Error(
       `Pexels image download HTTP ${imageResponse.status}`
     );
@@ -1179,24 +1297,21 @@ async function fetchStockImageBytes(
     await imageResponse.blob();
 
   if (
-    !blob.type ||
-    !blob.type.startsWith(
-      "image/"
-    )
+    blob.size === 0
   ) {
     throw new Error(
-      `Pexels returned invalid content type: ${blob.type}`
+      "Pexels returned an empty image."
     );
   }
 
-  if (blob.size === 0) {
-    throw new Error(
-      "Pexels returned an empty image"
-    );
-  }
-
+  /*
+   * Some CDNs return application/octet-stream.
+   * Do not reject the image solely based on Content-Type.
+   *
+   * Sharp will validate the actual bytes later.
+   */
   console.info(
-    `[IMAGE] Pexels SUCCESS size=${blob.size} type=${blob.type}`
+    `[IMAGE] Pexels SUCCESS size=${blob.size} type=${blob.type || "unknown"}`
   );
 
   return blob;
@@ -1233,7 +1348,7 @@ function escapeXml(
 }
 
 // ============================================================
-// CLEAN HEADLINE
+// HEADLINE CLEANING
 // ============================================================
 
 function cleanHeadline(
@@ -1266,16 +1381,22 @@ function wrapHeadline(
       .split(/\s+/)
       .filter(Boolean);
 
-  if (words.length === 0) {
+  if (
+    words.length === 0
+  ) {
     return [];
   }
 
   const lines: string[] =
     [];
 
-  let current = "";
+  let current =
+    "";
 
   for (const word of words) {
+    /*
+     * Handle a single extremely long word.
+     */
     if (
       word.length >
         maxChars &&
@@ -1339,9 +1460,11 @@ function wrapHeadline(
   /*
    * Maximum 3 lines.
    *
-   * Never delete headline characters.
+   * Preserve all headline characters.
    */
-  if (lines.length <= 3) {
+  if (
+    lines.length <= 3
+  ) {
     return lines;
   }
 
@@ -1352,6 +1475,111 @@ function wrapHeadline(
       .slice(2)
       .join(" "),
   ];
+}
+
+// ============================================================
+// TWEMOJI
+// ============================================================
+
+const TWEMOJI_BASE =
+  "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/";
+
+const EMOJI_REGEX =
+  /(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F|\u200D(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F)?)*|\uFE0F/gu;
+
+const emojiCache =
+  new Map<
+    string,
+    string
+  >();
+
+async function emojiDataUri(
+  emoji: string
+): Promise<
+  string | null
+> {
+  let codePoint: string;
+
+  try {
+    codePoint =
+      twemoji.convert
+        .toCodePoint(
+          emoji
+        )
+        .toLowerCase();
+  } catch (error) {
+    console.warn(
+      `[IMAGE] Twemoji conversion failed for "${emoji}":`,
+      error
+    );
+
+    return null;
+  }
+
+  if (!codePoint) {
+    return null;
+  }
+
+  const cached =
+    emojiCache.get(
+      codePoint
+    );
+
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const response =
+      await fetch(
+        `${TWEMOJI_BASE}${codePoint}.svg`,
+        {
+          signal:
+            AbortSignal.timeout(
+              TWEMOJI_TIMEOUT_MS
+            ),
+        }
+      );
+
+    if (
+      !response.ok
+    ) {
+      console.warn(
+        `[IMAGE] Twemoji HTTP ${response.status} for ${emoji}`
+      );
+
+      return null;
+    }
+
+    const svgText =
+      await response.text();
+
+    if (!svgText) {
+      return null;
+    }
+
+    const dataUri =
+      `data:image/svg+xml;base64,${Buffer.from(
+        svgText,
+        "utf8"
+      ).toString(
+        "base64"
+      )}`;
+
+    emojiCache.set(
+      codePoint,
+      dataUri
+    );
+
+    return dataUri;
+  } catch (error) {
+    console.warn(
+      `[IMAGE] Twemoji fetch failed for ${emoji}:`,
+      error
+    );
+
+    return null;
+  }
 }
 
 // ============================================================
@@ -1376,15 +1604,14 @@ async function createHeadlineSvg(
       22
     );
 
-  if (!lines.length) {
+  if (
+    lines.length === 0
+  ) {
     throw new Error(
       "Unable to create headline overlay."
     );
   }
 
-  /*
-   * Font sizes.
-   */
   const fontSize =
     lines.length === 1
       ? 76
@@ -1407,111 +1634,14 @@ async function createHeadlineSvg(
     totalTextHeight -
     bottomMargin;
 
-  const CENTER_X =
+  const centerX =
     FINAL_WIDTH / 2;
 
   /*
-   * IMPORTANT
-   *
-   * This family is mapped through our bundled
-   * DejaVu font + fontconfig.
-   *
-   * Do NOT use Arial.
+   * This family is mapped through fontconfig.
    */
-  const FONT_FAMILY =
+  const fontFamily =
     "HeadlineFont";
-
-  // ----------------------------------------------------------
-  // TWEMOJI
-  // ----------------------------------------------------------
-
-  const twemojiBase =
-    "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/";
-
-  const emojiRegex =
-    /(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F|\u200D(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F)?)*|\uFE0F/gu;
-
-  const emojiCache =
-    new Map<
-      string,
-      string
-    >();
-
-  async function emojiDataUri(
-    emoji: string
-  ): Promise<
-    string | null
-  > {
-    const codePoint =
-      twemoji.convert
-        .toCodePoint(
-          emoji
-        )
-        .toLowerCase();
-
-    if (!codePoint) {
-      return null;
-    }
-
-    const cached =
-      emojiCache.get(
-        codePoint
-      );
-
-    if (cached) {
-      return cached;
-    }
-
-    try {
-      const response =
-        await fetch(
-          `${twemojiBase}${codePoint}.svg`,
-          {
-            signal:
-              AbortSignal.timeout(
-                10_000
-              ),
-          }
-        );
-
-      if (!response.ok) {
-        console.warn(
-          `[IMAGE] Twemoji HTTP ${response.status} for ${emoji}`
-        );
-
-        return null;
-      }
-
-      const svgText =
-        await response.text();
-
-      const dataUri =
-        `data:image/svg+xml;base64,${Buffer.from(
-          svgText,
-          "utf8"
-        ).toString(
-          "base64"
-        )}`;
-
-      emojiCache.set(
-        codePoint,
-        dataUri
-      );
-
-      return dataUri;
-    } catch (error) {
-      console.warn(
-        `[IMAGE] Twemoji fetch failed for ${emoji}:`,
-        error
-      );
-
-      return null;
-    }
-  }
-
-  // ----------------------------------------------------------
-  // TEXT ELEMENTS
-  // ----------------------------------------------------------
 
   const lineElements =
     await Promise.all(
@@ -1528,20 +1658,26 @@ async function createHeadlineSvg(
           const matches =
             [
               ...line.matchAll(
-                emojiRegex
+                EMOJI_REGEX
               ),
             ];
 
+          /*
+           * Current implementation supports the final emoji
+           * on a line as a separate SVG image.
+           */
           const lastMatch =
-            matches.length > 0
+            matches.length >
+            0
               ? matches[
                   matches.length - 1
                 ]
               : null;
 
           const emojiPart =
-            lastMatch?.index !==
-            undefined
+            lastMatch &&
+            lastMatch.index !==
+              undefined
               ? lastMatch[0]
               : null;
 
@@ -1560,41 +1696,42 @@ async function createHeadlineSvg(
           const elements: string[] =
             [];
 
-          // --------------------------------------------------
-          // HEADLINE TEXT
-          // --------------------------------------------------
-
           if (textPart) {
             elements.push(
-              `<text
-                x="${CENTER_X}"
-                y="${y}"
-                text-anchor="middle"
-                font-family="${FONT_FAMILY}"
-                font-size="${fontSize}px"
-                font-weight="700"
-                fill="#FFFFFF"
-                stroke="#000000"
-                stroke-width="8"
-                stroke-linejoin="round"
-                style="paint-order:stroke fill"
-              >${escapeXml(
-                textPart
-              )}</text>`
+              `<text ` +
+                `x="${centerX}" ` +
+                `y="${y}" ` +
+                `text-anchor="middle" ` +
+                `font-family="${fontFamily}" ` +
+                `font-size="${fontSize}px" ` +
+                `font-weight="700" ` +
+                `fill="#FFFFFF" ` +
+                `stroke="#000000" ` +
+                `stroke-width="8" ` +
+                `stroke-linejoin="round" ` +
+                `style="paint-order:stroke fill">` +
+                `${escapeXml(
+                  textPart
+                )}` +
+                `</text>`
             );
           }
 
-          // --------------------------------------------------
-          // EMOJI
-          // --------------------------------------------------
-
-          if (emojiPart) {
+          if (
+            emojiPart
+          ) {
             const dataUri =
               await emojiDataUri(
                 emojiPart
               );
 
             if (dataUri) {
+              /*
+               * Approximate text width.
+               *
+               * This is intentionally conservative because
+               * SVG text metrics are not available here.
+               */
               const estimatedTextWidth =
                 Math.min(
                   textPart.length *
@@ -1612,7 +1749,7 @@ async function createHeadlineSvg(
                 16;
 
               let emojiX =
-                CENTER_X +
+                centerX +
                 estimatedTextWidth /
                   2 +
                 emojiGap;
@@ -1646,22 +1783,21 @@ async function createHeadlineSvg(
                   0.84;
 
               elements.push(
-                `<image
-                  x="${emojiX.toFixed(
+                `<image ` +
+                  `x="${emojiX.toFixed(
                     2
-                  )}"
-                  y="${emojiY.toFixed(
+                  )}" ` +
+                  `y="${emojiY.toFixed(
                     2
-                  )}"
-                  width="${emojiWidth.toFixed(
+                  )}" ` +
+                  `width="${emojiWidth.toFixed(
                     2
-                  )}"
-                  height="${emojiWidth.toFixed(
+                  )}" ` +
+                  `height="${emojiWidth.toFixed(
                     2
-                  )}"
-                  href="${dataUri}"
-                  preserveAspectRatio="xMidYMid meet"
-                />`
+                  )}" ` +
+                  `href="${dataUri}" ` +
+                  `preserveAspectRatio="xMidYMid meet"/>`
               );
             }
           }
@@ -1674,14 +1810,11 @@ async function createHeadlineSvg(
     );
 
   /*
-   * IMPORTANT:
+   * Keep SVG deliberately simple.
    *
-   * Keep SVG simple.
-   *
-   * No SVG filters.
+   * No filters.
    * No external fonts.
-   * No Arial.
-   * No unsupported SVG font declarations.
+   * No unsupported SVG features.
    */
   const svg =
     `<?xml version="1.0" encoding="UTF-8"?>` +
@@ -1718,128 +1851,143 @@ async function applyHeadlineOverlay(
     );
   }
 
-  console.info(
-    `[IMAGE] REQUIRED HEADLINE="${cleanTitle}"`
-  );
-
-  console.info(
-    `[IMAGE] OVERLAY START title="${cleanTitle}"`
-  );
-
   const inputBuffer =
     Buffer.from(
       await blob.arrayBuffer()
     );
 
   if (
-    inputBuffer.length === 0
+    inputBuffer.length ===
+    0
   ) {
     throw new Error(
       "Cannot apply headline: source image is empty."
     );
   }
 
+  console.info(
+    `[IMAGE] OVERLAY START title="${cleanTitle}"`
+  );
+
   const sharp =
     await getSharp();
 
-  // ----------------------------------------------------------
-  // BASE IMAGE
-  // ----------------------------------------------------------
+  /*
+   * Validate source and create final 1080x1080 image.
+   */
+  let baseImage: Buffer;
 
-  const baseImage =
-    await sharp(
-      inputBuffer
-    )
-      .resize(
-        FINAL_WIDTH,
-        FINAL_HEIGHT,
-        {
-          fit: "cover",
-          position: "centre",
-        }
+  try {
+    baseImage =
+      await sharp(
+        inputBuffer
       )
-      .jpeg({
-        quality: 92,
-        mozjpeg: true,
-      })
-      .toBuffer();
+        .rotate()
+        .resize(
+          FINAL_WIDTH,
+          FINAL_HEIGHT,
+          {
+            fit: "cover",
+            position:
+              "centre",
+            withoutEnlargement:
+              false,
+          }
+        )
+        .jpeg({
+          quality: 92,
+          mozjpeg: true,
+        })
+        .toBuffer();
+  } catch (error) {
+    throw new Error(
+      `Sharp could not process source image: ${
+        error instanceof Error
+          ? error.message
+          : String(error)
+      }`
+    );
+  }
 
   if (
-    baseImage.length === 0
+    baseImage.length ===
+    0
   ) {
     throw new Error(
       "Base image processing produced empty output."
     );
   }
 
-  // ----------------------------------------------------------
-  // HEADLINE SVG
-  // ----------------------------------------------------------
-
+  /*
+   * Create headline SVG.
+   */
   const svgOverlay =
     await createHeadlineSvg(
       cleanTitle
     );
 
-  console.info(
-    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length}`
-  );
-
   if (
-    svgOverlay.length < 100
+    svgOverlay.length <
+    100
   ) {
     throw new Error(
       "Headline SVG was unexpectedly empty."
     );
   }
 
-  // ----------------------------------------------------------
-  // COMPOSITE
-  // ----------------------------------------------------------
+  console.info(
+    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length}`
+  );
 
-  const outputBuffer =
-    await sharp(
-      baseImage
-    )
-      .composite([
-        {
-          input:
-            svgOverlay,
-          top: 0,
-          left: 0,
-        },
-      ])
-      .jpeg({
-        quality: 92,
-        mozjpeg: true,
-      })
-      .toBuffer();
+  /*
+   * Composite headline.
+   */
+  let outputBuffer: Buffer;
+
+  try {
+    outputBuffer =
+      await sharp(
+        baseImage
+      )
+        .composite([
+          {
+            input:
+              svgOverlay,
+            top: 0,
+            left: 0,
+          },
+        ])
+        .jpeg({
+          quality: 92,
+          mozjpeg: true,
+        })
+        .toBuffer();
+  } catch (error) {
+    throw new Error(
+      `Sharp headline composite failed: ${
+        error instanceof Error
+          ? error.message
+          : String(error)
+      }`
+    );
+  }
 
   if (
-    outputBuffer.length === 0
+    outputBuffer.length ===
+    0
   ) {
     throw new Error(
       "Headline overlay produced an empty image."
     );
   }
 
-  // ----------------------------------------------------------
-  // VERIFY FINAL IMAGE
-  // ----------------------------------------------------------
-
+  /*
+   * Verify final dimensions.
+   */
   const metadata =
     await sharp(
       outputBuffer
     ).metadata();
-
-  if (
-    !metadata.width ||
-    !metadata.height
-  ) {
-    throw new Error(
-      "Headline overlay verification failed: invalid final image."
-    );
-  }
 
   if (
     metadata.width !==
@@ -1848,7 +1996,7 @@ async function applyHeadlineOverlay(
       FINAL_HEIGHT
   ) {
     throw new Error(
-      `Headline overlay verification failed: expected ${FINAL_WIDTH}x${FINAL_HEIGHT}, got ${metadata.width}x${metadata.height}.`
+      `Final image dimensions are invalid. Expected ${FINAL_WIDTH}x${FINAL_HEIGHT}, got ${metadata.width ?? "unknown"}x${metadata.height ?? "unknown"}.`
     );
   }
 
@@ -1856,13 +2004,17 @@ async function applyHeadlineOverlay(
     `[IMAGE] OVERLAY SUCCESS title="${cleanTitle}" width=${metadata.width} height=${metadata.height} bytes=${outputBuffer.length}`
   );
 
+  /*
+   * Buffer is already a valid Uint8Array.
+   *
+   * Using a Uint8Array avoids ArrayBuffer typing problems
+   * caused by Node's SharedArrayBuffer typings.
+   */
   return new Blob(
     [
-      outputBuffer.buffer.slice(
-        outputBuffer.byteOffset,
-        outputBuffer.byteOffset +
-          outputBuffer.byteLength
-      ) as ArrayBuffer,
+      new Uint8Array(
+        outputBuffer
+      ),
     ],
     {
       type:
@@ -1916,12 +2068,13 @@ export async function generateImage(
     `[IMAGE] REQUIRED HEADLINE="${cleanTitle}"`
   );
 
-  // ==========================================================
-  // AI SOURCE
-  // Gemini -> Sharp -> upload
-  // Pexels fallback -> Sharp -> upload
-  // ==========================================================
-
+  /*
+   * ==========================================================
+   * AI FIRST
+   * Gemini -> Sharp -> Supabase
+   * Gemini failure -> Pexels -> Sharp -> Supabase
+   * ==========================================================
+   */
   if (
     source === "ai"
   ) {
@@ -1947,7 +2100,7 @@ export async function generateImage(
     ) {
       const message =
         geminiError instanceof
-          Error
+        Error
           ? geminiError.message
           : String(
               geminiError
@@ -1978,7 +2131,7 @@ export async function generateImage(
       ) {
         const message2 =
           pexelsError instanceof
-            Error
+          Error
             ? pexelsError.message
             : String(
                 pexelsError
@@ -1995,12 +2148,13 @@ export async function generateImage(
     }
   }
 
-  // ==========================================================
-  // STOCK SOURCE
-  // Pexels -> Sharp -> upload
-  // Gemini fallback -> Sharp -> upload
-  // ==========================================================
-
+  /*
+   * ==========================================================
+   * STOCK FIRST
+   * Pexels -> Sharp -> Supabase
+   * Pexels failure -> Gemini -> Sharp -> Supabase
+   * ==========================================================
+   */
   try {
     const baseBlob =
       await fetchStockImageBytes(
@@ -2022,7 +2176,7 @@ export async function generateImage(
   ) {
     const message =
       pexelsError instanceof
-        Error
+      Error
         ? pexelsError.message
         : String(
             pexelsError
@@ -2054,7 +2208,7 @@ export async function generateImage(
     ) {
       const message2 =
         geminiError instanceof
-          Error
+        Error
           ? geminiError.message
           : String(
               geminiError
@@ -2093,7 +2247,7 @@ async function upload(
       .toISOString()
       .slice(0, 10);
 
-  const path =
+  const storagePath =
     `${date}/${randomUUID()}.${extension}`;
 
   const bytes =
@@ -2101,14 +2255,17 @@ async function upload(
       await blob.arrayBuffer()
     );
 
-  if (bytes.length === 0) {
+  if (
+    bytes.length ===
+    0
+  ) {
     throw new Error(
       "Cannot upload empty image."
     );
   }
 
   console.info(
-    `[IMAGE] SUPABASE UPLOAD source=${source} path=${path} size=${bytes.length}`
+    `[IMAGE] SUPABASE UPLOAD source=${source} path=${storagePath} size=${bytes.length}`
   );
 
   const {
@@ -2119,11 +2276,13 @@ async function upload(
         STORAGE_BUCKET
       )
       .upload(
-        path,
+        storagePath,
         bytes,
         {
           contentType:
             "image/jpeg",
+          cacheControl:
+            "31536000",
           upsert: false,
         }
       );
@@ -2142,11 +2301,16 @@ async function upload(
         STORAGE_BUCKET
       )
       .getPublicUrl(
-        path
+        storagePath
       );
 
+  const publicUrl =
+    data?.publicUrl;
+
   if (
-    !data?.publicUrl
+    typeof publicUrl !==
+      "string" ||
+    !publicUrl
   ) {
     throw new Error(
       "Supabase did not return public image URL."
@@ -2154,12 +2318,13 @@ async function upload(
   }
 
   console.info(
-    `[IMAGE] SUPABASE UPLOAD SUCCESS source=${source} url=${data.publicUrl}`
+    `[IMAGE] SUPABASE UPLOAD SUCCESS source=${source} url=${publicUrl}`
   );
 
   return {
     url:
-      data.publicUrl,
+      publicUrl,
     source,
   };
 }
+

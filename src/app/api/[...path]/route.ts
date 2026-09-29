@@ -1,4 +1,4 @@
-import { NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 
 import { env } from "@/lib/env";
@@ -104,7 +104,7 @@ const ImageBody = z.object({
     .string()
     .trim()
     .min(2)
-    .max(300),
+    .max(1200),
 
   /*
    * REQUIRED:
@@ -243,11 +243,7 @@ const UpdateSettingsBody = z.object({
 });
 
 const CreateTopicBody = z.object({
-  text: z
-    .string()
-    .trim()
-    .min(2)
-    .max(200),
+  texts: z.array(z.string().trim().min(2).max(200)).min(1),
 });
 
 const UpdateTopicBody = z.object({
@@ -437,12 +433,26 @@ async function handleGet(
   // ----------------------------------------------------------
 
   if (route === "topics") {
-    const topics =
-      await getTopics();
+    try {
+      const topics = await getTopics();
 
-    return json(topics);
+      return json({
+        topics,
+      });
+    } catch (err) {
+      console.error("[API] Get topics failed:", err);
+
+      return json(
+        {
+          error: errorMessage(
+            err,
+            "Failed to load topics."
+          ),
+        },
+        500
+      );
+    }
   }
-
   // ----------------------------------------------------------
   // FACEBOOK PAGES
   // ----------------------------------------------------------
@@ -549,12 +559,24 @@ async function handlePost(
     }
 
     const session =
-      await createSession();
+  await createSession();
 
-    const response =
-      json({
-        ok: true,
-      });
+const response =
+  NextResponse.json({
+    ok: true,
+  });
+
+response.cookies.set(
+  "pab_session",
+  session,
+  {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 30,
+  }
+);
 
     /*
      * createSession() is expected to handle the cookie
@@ -677,6 +699,7 @@ async function handlePost(
       title,
       source,
     } = parsed.data;
+    console.info("[API] TITLE UNICODE:", Array.from(title).map((c) => "U+" + c.codePointAt(0)?.toString(16).toUpperCase()));
 
     console.info(
       "[API] IMAGE REQUEST:",
@@ -718,11 +741,9 @@ async function handlePost(
         "[API] IMAGE GENERATION SUCCESS:",
         {
           title,
-          source,
-          imageUrl:
-            result?.url ?? null,
-          imageSource:
-            result?.source ?? null,
+          requestedSource: source,
+          actualSource: result?.source ?? null,
+          imageUrl: result?.url ?? null,
         }
       );
 
@@ -886,20 +907,16 @@ async function handlePost(
       return json(
         {
           error:
-            "Topic text is required.",
+            "At least one topic is required.",
         },
         400
       );
     }
 
     try {
-      const topic =
-        await createTopic([parsed.data.text]);
+      const result = await createTopic(parsed.data.texts);
 
-      return json(
-        topic,
-        201
-      );
+    return json(result, 201);
     } catch (err) {
       console.error(
         "[API] Create topic failed:",
@@ -1617,6 +1634,18 @@ export async function DELETE(
 ) {
   return dispatch(req);
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

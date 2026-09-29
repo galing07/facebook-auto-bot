@@ -19,7 +19,6 @@ const GEMINI_IMAGE_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/interactions";
 
 const GEMINI_TIMEOUT_MS = 90_000;
-
 const PEXELS_TIMEOUT_MS = 20_000;
 
 // ============================================================
@@ -67,13 +66,6 @@ const PHOTO_STYLE = [
   "no grid",
 ].join(", ");
 
-/*
- * Detect the visual subject from the topic/prompt.
- *
- * IMPORTANT:
- * The topic controls WHAT the image shows.
- * The title is only used later by Sharp as the exact headline.
- */
 function detectVisualCategory(
   prompt: string
 ): {
@@ -132,6 +124,7 @@ function detectVisualCategory(
       visual:
         "an appetizing food dish as the clear main subject, attractive presentation, realistic ingredients, restaurant or street-food atmosphere, close-up culinary photography",
     },
+
     {
       category: "TRAVEL",
       keywords: [
@@ -165,6 +158,7 @@ function detectVisualCategory(
       visual:
         "a beautiful travel destination as the clear main subject, scenic landscape or recognizable tourist environment, travel atmosphere, exploration and vacation feeling, professional travel photography",
     },
+
     {
       category: "TECHNOLOGY",
       keywords: [
@@ -192,6 +186,7 @@ function detectVisualCategory(
       visual:
         "modern technology as the clear main subject, contemporary devices or digital innovation, realistic workspace or technological environment, premium technology photography",
     },
+
     {
       category: "HEALTH",
       keywords: [
@@ -216,6 +211,7 @@ function detectVisualCategory(
       visual:
         "a realistic healthy lifestyle scene as the clear main subject, healthy food, exercise, wellness activity, or appropriate healthcare context depending on the topic",
     },
+
     {
       category: "FASHION",
       keywords: [
@@ -238,6 +234,7 @@ function detectVisualCategory(
       visual:
         "fashion and style as the clear main subject, contemporary clothing or styling, realistic editorial photography, attractive modern presentation",
     },
+
     {
       category: "SPORTS",
       keywords: [
@@ -261,6 +258,7 @@ function detectVisualCategory(
       visual:
         "a realistic sports scene with the relevant athletic activity as the clear main subject, dynamic action, authentic sporting environment, professional sports photography",
     },
+
     {
       category: "NATURE",
       keywords: [
@@ -285,6 +283,7 @@ function detectVisualCategory(
       visual:
         "a beautiful natural environment or relevant wildlife as the clear main subject, realistic landscape photography, natural atmosphere and detailed scenery",
     },
+
     {
       category: "BUSINESS",
       keywords: [
@@ -411,11 +410,6 @@ function buildPexelsQuery(
       prompt
     );
 
-  /*
-   * Pexels needs a short photographic search query.
-   * Use the detected category + topic rather than sending
-   * the entire AI instruction to the search engine.
-   */
   const categoryQuery: Record<
     string,
     string
@@ -446,12 +440,6 @@ function buildPexelsQuery(
     ] ??
     "lifestyle";
 
-  /*
-   * Extract the actual topic from the AI-generated prompt.
-   * Remove visual-generation instructions so Pexels searches
-   * for the real subject instead of phrases such as
-   * "cinematic photograph related to".
-   */
   const topicText =
     prompt
       .replace(
@@ -525,9 +513,6 @@ function buildPexelsQuery(
       .split(/\s+/)
       .filter(Boolean);
 
-  /*
-   * Remove generic words and keep the actual topic.
-   */
   const genericWords =
     new Set([
       "today",
@@ -573,8 +558,6 @@ function buildPexelsQuery(
 
 // ============================================================
 // GEMINI IMAGE GENERATION
-// ============================================================
-
 // ============================================================
 
 async function fetchGeminiImageBytes(
@@ -695,10 +678,6 @@ async function fetchGeminiImageBytes(
     );
   }
 
-  // ==========================================================
-  // PRIMARY: output_image.data
-  // ==========================================================
-
   const outputImage =
     data?.output_image;
 
@@ -737,10 +716,6 @@ async function fetchGeminiImageBytes(
       }
     );
   }
-
-  // ==========================================================
-  // SECONDARY: steps[].content[]
-  // ==========================================================
 
   const steps =
     Array.isArray(data?.steps)
@@ -1025,7 +1000,7 @@ function escapeXml(
 }
 
 // ============================================================
-// REMOVE UNSAFE CHARACTERS
+// CLEAN HEADLINE
 // ============================================================
 
 function cleanHeadline(
@@ -1033,8 +1008,6 @@ function cleanHeadline(
 ): string {
   return title
     .trim()
-    // Remove control characters only.
-    // IMPORTANT: preserve emoji such as 🌙, 🔥, ✈️, 🍜, etc.
     .replace(
       /[\u0000-\u001F\u007F]/g,
       " "
@@ -1070,24 +1043,38 @@ function wrapHeadline(
 
   for (const word of words) {
     /*
-     * Handle a single very long word.
+     * Handle very long individual words.
+     *
+     * IMPORTANT:
+     * Never silently remove characters.
      */
     if (
       word.length >
         maxChars &&
       !current
     ) {
-      lines.push(
-        word.slice(
-          0,
-          maxChars
-        )
-      );
+      let remaining =
+        word;
+
+      while (
+        remaining.length >
+        maxChars
+      ) {
+        lines.push(
+          remaining.slice(
+            0,
+            maxChars
+          )
+        );
+
+        remaining =
+          remaining.slice(
+            maxChars
+          );
+      }
 
       current =
-        word.slice(
-          maxChars
-        );
+        remaining;
 
       continue;
     }
@@ -1123,26 +1110,22 @@ function wrapHeadline(
 
   /*
    * Maximum three lines.
+   *
+   * If there are more than three,
+   * combine everything remaining into
+   * the third line rather than deleting
+   * the last characters.
    */
   if (lines.length <= 3) {
     return lines;
   }
 
-  const first =
-    lines[0];
-
-  const second =
-    lines[1];
-
-  const remaining =
+  return [
+    lines[0],
+    lines[1],
     lines
       .slice(2)
-      .join(" ");
-
-  return [
-    first,
-    second,
-    remaining,
+      .join(" "),
   ];
 }
 
@@ -1150,34 +1133,69 @@ function wrapHeadline(
 // HEADLINE SVG
 // ============================================================
 
-async function createHeadlineSvg(title: string): Promise<Buffer> {
-  const cleanTitle = cleanHeadline(title);
+async function createHeadlineSvg(
+  title: string
+): Promise<Buffer> {
+  const cleanTitle =
+    cleanHeadline(title);
+
   if (!cleanTitle) {
-    throw new Error("Headline title is empty after cleaning.");
+    throw new Error(
+      "Headline title is empty after cleaning."
+    );
   }
 
-  const lines = wrapHeadline(cleanTitle, 22);
+  const lines =
+    wrapHeadline(
+      cleanTitle,
+      22
+    );
+
   if (!lines.length) {
-    throw new Error("Unable to create headline overlay.");
+    throw new Error(
+      "Unable to create headline overlay."
+    );
   }
 
+  /*
+   * Conservative font sizes prevent clipping.
+   */
   const fontSize =
-    lines.length === 1 ? 82 :
-    lines.length === 2 ? 68 :
-    58;
+    lines.length === 1
+      ? 78
+      : lines.length === 2
+        ? 66
+        : 56;
 
-  const lineHeight = fontSize + 18;
-  const totalTextHeight = lines.length * lineHeight;
+  const lineHeight =
+    fontSize + 20;
+
+  const totalTextHeight =
+    lines.length *
+    lineHeight;
+
   const firstTextY =
-    FINAL_HEIGHT - totalTextHeight - 75;
+    FINAL_HEIGHT -
+    totalTextHeight -
+    75;
+
+  const CENTER_X =
+    FINAL_WIDTH / 2;
 
   const twemojiBase =
     "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/";
 
+  /*
+   * REAL Unicode emoji regex.
+   *
+   * IMPORTANT:
+   * Use \u, NOT \\u.
+   */
   const emojiRegex =
-    /(?:[\\u{1F000}-\\u{1FAFF}]|[\\u{2600}-\\u{27BF}])(?:\\uFE0F|\\u200D(?:[\\u{1F000}-\\u{1FAFF}]|[\\u{2600}-\\u{27BF}])(?:\\uFE0F)?)*|\\uFE0F/gu;
+    /(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F|\u200D(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F)?)*|\uFE0F/gu;
 
-  const emojiCache = new Map<string, string>();
+  const emojiCache =
+    new Map<string, string>();
 
   async function emojiDataUri(
     emoji: string
@@ -1187,22 +1205,30 @@ async function createHeadlineSvg(title: string): Promise<Buffer> {
         .toCodePoint(emoji)
         .toLowerCase();
 
-    if (!codePoint) return null;
+    if (!codePoint) {
+      return null;
+    }
 
     const cached =
-      emojiCache.get(codePoint);
+      emojiCache.get(
+        codePoint
+      );
 
-    if (cached) return cached;
+    if (cached) {
+      return cached;
+    }
 
     try {
-      const response = await fetch(
-        `${twemojiBase}${codePoint}.svg`
-      );
+      const response =
+        await fetch(
+          `${twemojiBase}${codePoint}.svg`
+        );
 
       if (!response.ok) {
         console.warn(
           `[IMAGE] Twemoji HTTP ${response.status} for ${emoji} (${codePoint})`
         );
+
         return null;
       }
 
@@ -1226,111 +1252,165 @@ async function createHeadlineSvg(title: string): Promise<Buffer> {
         `[IMAGE] Twemoji fetch failed for ${emoji}:`,
         error
       );
+
       return null;
     }
   }
 
   const lineElements =
     await Promise.all(
-      lines.map(async (line, index) => {
-        const y =
-          firstTextY +
-          index * lineHeight;
+      lines.map(
+        async (
+          line,
+          index
+        ) => {
+          const y =
+            firstTextY +
+            index * lineHeight;
 
-        const matches =
-          [...line.matchAll(emojiRegex)];
+          /*
+           * Find the final emoji in this line.
+           */
+          const matches =
+            [
+              ...line.matchAll(
+                emojiRegex
+              ),
+            ];
 
-        // Use the final emoji in the line as the emoji suffix.
-        // The headline text itself remains untouched.
-        const emojiMatch =
-          matches.length > 0
-            ? matches[matches.length - 1]
-            : null;
+          const lastMatch =
+            matches.length > 0
+              ? matches[
+                  matches.length - 1
+                ]
+              : null;
 
-        const emojiPart =
-          emojiMatch?.[0] ?? null;
+          const emojiPart =
+            lastMatch?.index !==
+            undefined
+              ? lastMatch[0]
+              : null;
 
-        const textPart =
-          emojiPart &&
-          emojiMatch?.index !== undefined
-            ? line
-                .slice(
-                  0,
-                  emojiMatch.index
-                )
-                .trimEnd()
-            : line;
+          /*
+           * Keep ALL non-emoji text exactly as supplied.
+           *
+           * No toUpperCase().
+           */
+          const textPart =
+            emojiPart &&
+            lastMatch?.index !==
+              undefined
+              ? line
+                  .slice(
+                    0,
+                    lastMatch.index
+                  )
+                  .trimEnd()
+              : line;
 
-        const upperText =
-          textPart.toUpperCase();
+          const exactText =
+            textPart;
 
-        /*
-         * IMPORTANT:
-         * The text is centered by SVG itself with text-anchor="middle".
-         * The width estimate is used ONLY to place the emoji after the
-         * centered text. It can never move the text itself.
-         */
-        const estimatedTextWidth =
-          upperText.length *
-          fontSize *
-          0.52;
+          /*
+           * SVG itself performs the centering.
+           *
+           * x=540 + text-anchor="middle"
+           *
+           * Therefore emoji calculation cannot move
+           * the headline.
+           */
+          const estimatedTextWidth =
+            exactText.length *
+            fontSize *
+            0.48;
 
-        const emojiWidth =
-          emojiPart
-            ? fontSize * 0.82
-            : 0;
+          const emojiWidth =
+            emojiPart
+              ? fontSize * 0.82
+              : 0;
 
-        const emojiGap =
-          emojiPart ? 28 : 0;
+          const emojiGap =
+            emojiPart
+              ? 18
+              : 0;
 
-        const elements: string[] = [];
+          const elements: string[] =
+            [];
 
-        if (upperText) {
-          elements.push(
-            `<text x="${FINAL_WIDTH / 2}" y="${y}" text-anchor="middle" dominant-baseline="alphabetic" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fontSize}px" font-weight="900" fill="#FFFFFF" stroke="#000000" stroke-width="10" stroke-linejoin="round" paint-order="stroke">${escapeXml(
-              upperText
-            )}</text>`
-          );
-        }
-
-        if (emojiPart) {
-          const dataUri =
-            await emojiDataUri(
-              emojiPart
-            );
-
-          if (dataUri) {
-            /*
-             * Emoji is positioned relative to the estimated right edge
-             * of the centered text. Even if the estimate is imperfect,
-             * the text remains exactly centered.
-             */
-            const emojiX =
-              FINAL_WIDTH / 2 +
-              estimatedTextWidth / 2 +
-              emojiGap;
-
-            const emojiY =
-              y - fontSize * 0.84;
-
+          if (exactText) {
             elements.push(
-              `<image x="${emojiX.toFixed(
-                2
-              )}" y="${emojiY.toFixed(
-                2
-              )}" width="${emojiWidth.toFixed(
-                2
-              )}" height="${emojiWidth.toFixed(
-                2
-              )}" href="${dataUri}" preserveAspectRatio="xMidYMid meet" />`
+              `<text x="${CENTER_X}" y="${y}" text-anchor="middle" dominant-baseline="alphabetic" font-family="DejaVu Sans, Arial, sans-serif" font-size="${fontSize}px" font-weight="900" fill="#FFFFFF" stroke="#000000" stroke-width="10" stroke-linejoin="round" paint-order="stroke">${escapeXml(
+                exactText
+              )}</text>`
             );
           }
-        }
 
-        return `<g>${elements.join(
-          "\n"
-        )}</g>`;
-      })
+          if (emojiPart) {
+            const dataUri =
+              await emojiDataUri(
+                emojiPart
+              );
+
+            if (dataUri) {
+              /*
+               * Put emoji immediately after the centered text.
+               */
+              let emojiX =
+                CENTER_X +
+                estimatedTextWidth /
+                  2 +
+                emojiGap;
+
+              const rightPadding =
+                45;
+
+              /*
+               * Never let emoji leave the canvas.
+               */
+              if (
+                emojiX +
+                  emojiWidth >
+                FINAL_WIDTH -
+                  rightPadding
+              ) {
+                emojiX =
+                  FINAL_WIDTH -
+                  rightPadding -
+                  emojiWidth;
+              }
+
+              if (
+                emojiX <
+                rightPadding
+              ) {
+                emojiX =
+                  rightPadding;
+              }
+
+              const emojiY =
+                y -
+                fontSize *
+                  0.84;
+
+              elements.push(
+                `<image x="${emojiX.toFixed(
+                  2
+                )}" y="${emojiY.toFixed(
+                  2
+                )}" width="${emojiWidth.toFixed(
+                  2
+                )}" height="${emojiWidth.toFixed(
+                  2
+                )}" href="${dataUri}" preserveAspectRatio="xMidYMid meet" />`
+              );
+            }
+          }
+
+          return `<g>${elements.join(
+            "\n"
+          )}</g>`;
+        }
+      )
     );
 
   const svg = `
@@ -1369,22 +1449,18 @@ async function createHeadlineSvg(title: string): Promise<Buffer> {
     "utf8"
   );
 }
+
+// ============================================================
+// APPLY HEADLINE OVERLAY
+// ============================================================
+
 async function applyHeadlineOverlay(
   blob: Blob,
   title: string
 ): Promise<Blob> {
   const cleanTitle =
-    cleanHeadline(
-      title
-    );
+    cleanHeadline(title);
 
-  /*
-   * CRITICAL:
-   *
-   * Never silently return the original image.
-   *
-   * If title is missing, generation FAILS.
-   */
   if (!cleanTitle) {
     throw new Error(
       "Cannot generate final image: Facebook headline/title is empty."
@@ -1412,9 +1488,6 @@ async function applyHeadlineOverlay(
     );
   }
 
-  /*
-   * First normalize the source image.
-   */
   const baseImage =
     await sharp(
       inputBuffer
@@ -1446,9 +1519,6 @@ async function applyHeadlineOverlay(
       cleanTitle
     );
 
-  /*
-   * Composite the headline.
-   */
   const outputBuffer =
     await sharp(
       baseImage
@@ -1457,9 +1527,7 @@ async function applyHeadlineOverlay(
         {
           input:
             svgOverlay,
-
           top: 0,
-
           left: 0,
         },
       ])
@@ -1477,9 +1545,6 @@ async function applyHeadlineOverlay(
     );
   }
 
-  /*
-   * VERIFY FINAL IMAGE.
-   */
   const metadata =
     await sharp(
       outputBuffer
@@ -1494,21 +1559,27 @@ async function applyHeadlineOverlay(
     );
   }
 
+  if (
+    metadata.width !==
+      FINAL_WIDTH ||
+    metadata.height !==
+      FINAL_HEIGHT
+  ) {
+    throw new Error(
+      `Headline overlay verification failed: expected ${FINAL_WIDTH}x${FINAL_HEIGHT}, got ${metadata.width}x${metadata.height}.`
+    );
+  }
+
   console.info(
     `[IMAGE] OVERLAY SUCCESS title="${cleanTitle}" width=${metadata.width} height=${metadata.height} bytes=${outputBuffer.length}`
   );
 
-  /*
-   * IMPORTANT:
-   *
-   * Only this final image is returned.
-   * The original base image is never uploaded.
-   */
   return new Blob(
     [
       outputBuffer.buffer.slice(
         outputBuffer.byteOffset,
-        outputBuffer.byteOffset + outputBuffer.byteLength
+        outputBuffer.byteOffset +
+          outputBuffer.byteLength
       ) as ArrayBuffer,
     ],
     {
@@ -1543,11 +1614,6 @@ export async function generateImage(
     );
   }
 
-  /*
-   * CRITICAL:
-   *
-   * Title is mandatory.
-   */
   if (!cleanTitle) {
     throw new Error(
       "Facebook headline/title is required for image generation."
@@ -1583,9 +1649,6 @@ export async function generateImage(
           cleanTitle
         );
 
-      /*
-       * NEVER upload Gemini base image directly.
-       */
       const finalBlob =
         await applyHeadlineOverlay(
           baseBlob,
@@ -1600,7 +1663,9 @@ export async function generateImage(
       const message =
         geminiError instanceof Error
           ? geminiError.message
-          : String(geminiError);
+          : String(
+              geminiError
+            );
 
       console.error(
         `[IMAGE] Gemini FAILED: ${message}`
@@ -1612,10 +1677,6 @@ export async function generateImage(
             cleanPrompt
           );
 
-        /*
-         * Pexels fallback ALSO receives
-         * the mandatory Sharp headline.
-         */
         const finalBlob =
           await applyHeadlineOverlay(
             baseBlob,
@@ -1630,7 +1691,9 @@ export async function generateImage(
         const message2 =
           pexelsError instanceof Error
             ? pexelsError.message
-            : String(pexelsError);
+            : String(
+                pexelsError
+              );
 
         console.error(
           `[IMAGE] Pexels FALLBACK FAILED: ${message2}`
@@ -1669,7 +1732,9 @@ export async function generateImage(
     const message =
       pexelsError instanceof Error
         ? pexelsError.message
-        : String(pexelsError);
+        : String(
+            pexelsError
+          );
 
     console.error(
       `[IMAGE] Pexels FAILED: ${message}`
@@ -1696,7 +1761,9 @@ export async function generateImage(
       const message2 =
         geminiError instanceof Error
           ? geminiError.message
-          : String(geminiError);
+          : String(
+              geminiError
+            );
 
       console.error(
         `[IMAGE] Gemini FALLBACK FAILED: ${message2}`
@@ -1723,9 +1790,6 @@ async function upload(
   const db =
     supabaseAdmin();
 
-  /*
-   * generateImage() always returns JPEG after Sharp.
-   */
   const extension =
     "jpg";
 
@@ -1765,7 +1829,6 @@ async function upload(
         {
           contentType:
             "image/jpeg",
-
           upsert: false,
         }
       );
@@ -1802,13 +1865,7 @@ async function upload(
   return {
     url:
       data.publicUrl,
-
     source,
   };
 }
-
-
-
-
-
 

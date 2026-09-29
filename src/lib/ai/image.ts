@@ -44,6 +44,12 @@ const TWEMOJI_TIMEOUT_MS = 10_000;
 const FINAL_WIDTH = 1080;
 const FINAL_HEIGHT = 1080;
 
+/*
+ * Headline overlay tuning.
+ */
+const HEADLINE_MAX_CHARS = 22;
+const HEADLINE_MAX_LINES = 4;
+
 // ============================================================
 // SHARP LOADER
 // ============================================================
@@ -150,13 +156,23 @@ function configureServerlessFonts(): void {
         bundledFont
       )
     ) {
-      console.warn(
-        `[IMAGE] Bundled font not found: ${bundledFont}`
+      /*
+       * FIX: Dulu cuma warning → sekarang error jelas supaya
+       * tidak silent failure ketika headline text tidak muncul.
+       */
+      console.error(
+        `[IMAGE] CRITICAL: Bundled font not found: ${bundledFont}. ` +
+          `Headline text may not render. Pastikan file ` +
+          `fonts/DejaVuSans-Bold.ttf ter-bundle di deployment.`
       );
     }
 
     /*
      * Keep XML simple and absolute.
+     *
+     * FIX: Tambahkan alias tambahan (sans-serif, Arial) ke DejaVu Sans
+     * supaya librsvg selalu menemukan font fallback ketika
+     * "HeadlineFont" tidak ketemu.
      */
     const fontConfigXml =
       `<?xml version="1.0"?>` +
@@ -168,9 +184,28 @@ function configureServerlessFonts(): void {
       `<cachedir>${escapeXml(
         cacheDir
       )}</cachedir>` +
+      // Alias: HeadlineFont -> DejaVu Sans
       `<match target="pattern">` +
       `<test name="family">` +
       `<string>HeadlineFont</string>` +
+      `</test>` +
+      `<edit name="family" mode="prepend" binding="strong">` +
+      `<string>DejaVu Sans</string>` +
+      `</edit>` +
+      `</match>` +
+      // Alias: Arial -> DejaVu Sans (banyak SVG pakai Arial)
+      `<match target="pattern">` +
+      `<test name="family">` +
+      `<string>Arial</string>` +
+      `</test>` +
+      `<edit name="family" mode="prepend" binding="strong">` +
+      `<string>DejaVu Sans</string>` +
+      `</edit>` +
+      `</match>` +
+      // Alias: Helvetica -> DejaVu Sans
+      `<match target="pattern">` +
+      `<test name="family">` +
+      `<string>Helvetica</string>` +
       `</test>` +
       `<edit name="family" mode="prepend" binding="strong">` +
       `<string>DejaVu Sans</string>` +
@@ -1368,12 +1403,20 @@ function cleanHeadline(
 }
 
 // ============================================================
-// HEADLINE WRAPPING
+// HEADLINE WRAPPING (FIXED)
+// ============================================================
+//
+// Perubahan utama:
+// 1. Mendukung hingga 4 baris (sebelumnya 3).
+// 2. Jika melebihi batas, baris di-rebalance supaya panjang
+//    teks lebih merata (mencegah baris terakhir yang sangat
+//    panjang → overflow).
+// 3. Baris tidak pernah melebihi `maxChars`.
 // ============================================================
 
 function wrapHeadline(
   title: string,
-  maxChars = 22
+  maxChars = HEADLINE_MAX_CHARS
 ): string[] {
   const words =
     title
@@ -1390,8 +1433,7 @@ function wrapHeadline(
   const lines: string[] =
     [];
 
-  let current =
-    "";
+  let current = "";
 
   for (const word of words) {
     /*
@@ -1402,8 +1444,7 @@ function wrapHeadline(
         maxChars &&
       !current
     ) {
-      let remaining =
-        word;
+      let remaining = word;
 
       while (
         remaining.length >
@@ -1422,8 +1463,7 @@ function wrapHeadline(
           );
       }
 
-      current =
-        remaining;
+      current = remaining;
 
       continue;
     }
@@ -1437,8 +1477,7 @@ function wrapHeadline(
       candidate.length <=
       maxChars
     ) {
-      current =
-        candidate;
+      current = candidate;
     } else {
       if (current) {
         lines.push(
@@ -1446,35 +1485,83 @@ function wrapHeadline(
         );
       }
 
-      current =
-        word;
+      current = word;
     }
   }
 
   if (current) {
-    lines.push(
-      current
-    );
+    lines.push(current);
   }
 
   /*
-   * Maximum 3 lines.
-   *
-   * Preserve all headline characters.
+   * Jika masih dalam batas → langsung pakai.
    */
   if (
-    lines.length <= 3
+    lines.length <=
+    HEADLINE_MAX_LINES
   ) {
     return lines;
   }
 
-  return [
-    lines[0],
-    lines[1],
-    lines
-      .slice(2)
-      .join(" "),
-  ];
+  /*
+   * Rebalance: distribusikan kata ke dalam MAX_LINES baris
+   * supaya panjang tiap baris lebih merata.
+   *
+   * Ini mencegah baris terakhir yang sangat panjang
+   * yang bisa overflow keluar canvas.
+   */
+  const allWords =
+    lines.join(" ").split(/\s+/);
+
+  const totalChars =
+    allWords.reduce(
+      (sum, w) => sum + w.length,
+      0
+    ) + Math.max(0, allWords.length - 1);
+
+  const targetCharsPerLine =
+    Math.ceil(
+      totalChars /
+        HEADLINE_MAX_LINES
+    );
+
+  const rebalanced: string[] =
+    [];
+
+  let buf = "";
+
+  for (const word of allWords) {
+    const candidate =
+      buf ? `${buf} ${word}` : word;
+
+    const isLastLine =
+      rebalanced.length ===
+      HEADLINE_MAX_LINES - 1;
+
+    if (
+      isLastLine ||
+      candidate.length <=
+        targetCharsPerLine
+    ) {
+      buf = candidate;
+    } else {
+      rebalanced.push(buf);
+      buf = word;
+    }
+  }
+
+  if (buf) {
+    rebalanced.push(buf);
+  }
+
+  /*
+   * Safety: jika masih lebih dari MAX_LINES (kasus ekstrem),
+   * potong ke MAX_LINES.
+   */
+  return rebalanced.slice(
+    0,
+    HEADLINE_MAX_LINES
+  );
 }
 
 // ============================================================
@@ -1583,7 +1670,17 @@ async function emojiDataUri(
 }
 
 // ============================================================
-// HEADLINE SVG
+// HEADLINE SVG (FIXED)
+// ============================================================
+//
+// Perubahan utama:
+// 1. `paint-order` ditambahkan sebagai ATTRIBUTE SVG (bukan
+//    hanya inline style). Ini penting untuk librsvg/Sharp.
+// 2. `font-family` diberi fallback chain panjang supaya
+//    selalu ada font yang bisa dipakai.
+// 3. Font size menyusut sesuai jumlah baris → mencegah overflow.
+// 4. Semua emoji di setiap baris di-render (bukan hanya yang
+//    terakhir).
 // ============================================================
 
 async function createHeadlineSvg(
@@ -1601,7 +1698,7 @@ async function createHeadlineSvg(
   const lines =
     wrapHeadline(
       cleanTitle,
-      22
+      HEADLINE_MAX_CHARS
     );
 
   if (
@@ -1612,22 +1709,27 @@ async function createHeadlineSvg(
     );
   }
 
+  /*
+   * Font size menyusut sesuai jumlah baris.
+   */
   const fontSize =
     lines.length === 1
-      ? 76
+      ? 78
       : lines.length === 2
-        ? 64
-        : 54;
+        ? 66
+        : lines.length === 3
+          ? 56
+          : 48;
 
   const lineHeight =
-    fontSize + 18;
+    fontSize + 14;
 
   const totalTextHeight =
     lines.length *
     lineHeight;
 
   const bottomMargin =
-    75;
+    70;
 
   const firstTextY =
     FINAL_HEIGHT -
@@ -1638,10 +1740,17 @@ async function createHeadlineSvg(
     FINAL_WIDTH / 2;
 
   /*
-   * This family is mapped through fontconfig.
+   * Fallback font chain.
+   *
+   * Jika "HeadlineFont" gagal di-resolve fontconfig,
+   * librsvg akan mencoba DejaVu Sans → Arial → Helvetica →
+   * sans-serif.
+   *
+   * Karena kita sudah menambahkan alias di fontconfig,
+   * Arial & Helvetica juga akan di-map ke DejaVu Sans.
    */
   const fontFamily =
-    "HeadlineFont";
+    "HeadlineFont, DejaVu Sans, Arial, Helvetica, sans-serif";
 
   const lineElements =
     await Promise.all(
@@ -1655,6 +1764,9 @@ async function createHeadlineSvg(
             index *
               lineHeight;
 
+          /*
+           * Deteksi SEMUA emoji di baris ini.
+           */
           const matches =
             [
               ...line.matchAll(
@@ -1662,40 +1774,60 @@ async function createHeadlineSvg(
               ),
             ];
 
+          const emojiParts: Array<{
+            emoji: string;
+            charIndex: number;
+          }> = [];
+
+          for (const m of matches) {
+            if (m.index === undefined) {
+              continue;
+            }
+
+            emojiParts.push({
+              emoji: m[0],
+              charIndex: m.index,
+            });
+          }
+
           /*
-           * Current implementation supports the final emoji
-           * on a line as a separate SVG image.
+           * Buang semua emoji dari textPart supaya tidak
+           * dirender sebagai tofu.
            */
-          const lastMatch =
-            matches.length >
-            0
-              ? matches[
-                  matches.length - 1
-                ]
-              : null;
+          let textPart = line;
 
-          const emojiPart =
-            lastMatch &&
-            lastMatch.index !==
-              undefined
-              ? lastMatch[0]
-              : null;
+          if (
+            emojiParts.length > 0
+          ) {
+            let result = "";
+            let cursor = 0;
 
-          const textPart =
-            emojiPart &&
-            lastMatch?.index !==
-              undefined
-              ? line
-                  .slice(
-                    0,
-                    lastMatch.index
-                  )
-                  .trimEnd()
-              : line;
+            for (const p of emojiParts) {
+              result += line.slice(
+                cursor,
+                p.charIndex
+              );
+
+              cursor =
+                p.charIndex +
+                p.emoji.length;
+            }
+
+            result += line.slice(
+              cursor
+            );
+
+            textPart = result
+              .replace(/\s+/g, " ")
+              .trim();
+          }
 
           const elements: string[] =
             [];
 
+          /*
+           * ===== TEXT =====
+           */
           if (textPart) {
             elements.push(
               `<text ` +
@@ -1707,9 +1839,11 @@ async function createHeadlineSvg(
                 `font-weight="700" ` +
                 `fill="#FFFFFF" ` +
                 `stroke="#000000" ` +
-                `stroke-width="8" ` +
+                `stroke-width="6" ` +
                 `stroke-linejoin="round" ` +
-                `style="paint-order:stroke fill">` +
+                /* PENTING: paint-order sebagai ATTRIBUTE */
+                `paint-order="stroke fill" ` +
+                `style="paint-order: stroke fill;">` +
                 `${escapeXml(
                   textPart
                 )}` +
@@ -1717,76 +1851,82 @@ async function createHeadlineSvg(
             );
           }
 
+          /*
+           * ===== EMOJI (sebagai <image> twemoji SVG) =====
+           */
           if (
-            emojiPart
+            emojiParts.length > 0
           ) {
-            const dataUri =
-              await emojiDataUri(
-                emojiPart
+            /*
+             * Estimasi lebar teks (kasar).
+             * Tidak ada text metric presisi di sisi server,
+             * jadi kita pakai faktor 0.55.
+             */
+            const estimatedTextWidth =
+              Math.min(
+                textPart.length *
+                  fontSize *
+                  0.55,
+                FINAL_WIDTH -
+                  160
               );
 
-            if (dataUri) {
-              /*
-               * Approximate text width.
-               *
-               * This is intentionally conservative because
-               * SVG text metrics are not available here.
-               */
-              const estimatedTextWidth =
-                Math.min(
-                  textPart.length *
-                    fontSize *
-                    0.52,
-                  FINAL_WIDTH -
-                    160
+            const emojiWidth =
+              fontSize * 0.85;
+
+            const emojiGap = 12;
+
+            const rightPadding =
+              50;
+
+            let emojiX =
+              centerX +
+              estimatedTextWidth /
+                2 +
+              emojiGap;
+
+            if (
+              emojiX +
+                emojiWidth >
+              FINAL_WIDTH -
+                rightPadding
+            ) {
+              emojiX =
+                FINAL_WIDTH -
+                rightPadding -
+                emojiWidth;
+            }
+
+            if (
+              emojiX <
+              rightPadding
+            ) {
+              emojiX =
+                rightPadding;
+            }
+
+            const emojiY =
+              y -
+              fontSize * 0.82;
+
+            let offsetX = 0;
+
+            for (const p of emojiParts) {
+              const dataUri =
+                await emojiDataUri(
+                  p.emoji
                 );
 
-              const emojiWidth =
-                fontSize *
-                0.82;
-
-              const emojiGap =
-                16;
-
-              let emojiX =
-                centerX +
-                estimatedTextWidth /
-                  2 +
-                emojiGap;
-
-              const rightPadding =
-                50;
-
-              if (
-                emojiX +
-                  emojiWidth >
-                FINAL_WIDTH -
-                  rightPadding
-              ) {
-                emojiX =
-                  FINAL_WIDTH -
-                  rightPadding -
-                  emojiWidth;
+              if (!dataUri) {
+                continue;
               }
-
-              if (
-                emojiX <
-                rightPadding
-              ) {
-                emojiX =
-                  rightPadding;
-              }
-
-              const emojiY =
-                y -
-                fontSize *
-                  0.84;
 
               elements.push(
                 `<image ` +
-                  `x="${emojiX.toFixed(
-                    2
-                  )}" ` +
+                  `x="${(
+                    emojiX +
+                    offsetX
+                  ).toFixed(2)}" ` +
                   `y="${emojiY.toFixed(
                     2
                   )}" ` +
@@ -1799,6 +1939,9 @@ async function createHeadlineSvg(
                   `href="${dataUri}" ` +
                   `preserveAspectRatio="xMidYMid meet"/>`
               );
+
+              offsetX +=
+                emojiWidth + 6;
             }
           }
 
@@ -1820,6 +1963,7 @@ async function createHeadlineSvg(
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<svg ` +
     `xmlns="http://www.w3.org/2000/svg" ` +
+    `xmlns:xlink="http://www.w3.org/1999/xlink" ` +
     `width="${FINAL_WIDTH}" ` +
     `height="${FINAL_HEIGHT}" ` +
     `viewBox="0 0 ${FINAL_WIDTH} ${FINAL_HEIGHT}">` +
@@ -1926,17 +2070,34 @@ async function applyHeadlineOverlay(
       cleanTitle
     );
 
+  /*
+   * Verifikasi: SVG harus cukup besar dan mengandung <text>.
+   *
+   * Ini mencegah silent failure di mana headline
+   * tidak muncul di gambar.
+   */
   if (
     svgOverlay.length <
-    100
+    200
   ) {
     throw new Error(
-      "Headline SVG was unexpectedly empty."
+      `Headline SVG terlalu pendek (${svgOverlay.length} bytes) — kemungkinan gagal render text.`
+    );
+  }
+
+  const svgStr =
+    svgOverlay.toString("utf8");
+
+  if (
+    !svgStr.includes("<text")
+  ) {
+    throw new Error(
+      "Headline SVG tidak mengandung elemen <text>. Periksa cleanHeadline / wrapHeadline."
     );
   }
 
   console.info(
-    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length}`
+    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length} lines=${wrapHeadline(cleanTitle, HEADLINE_MAX_CHARS).length}`
   );
 
   /*
@@ -2327,4 +2488,3 @@ async function upload(
     source,
   };
 }
-

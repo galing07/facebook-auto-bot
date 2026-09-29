@@ -1,9 +1,9 @@
-import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import twemoji from "@twemoji/api";
+import sharp from "sharp";
 
 import { env } from "@/lib/env";
 import { supabaseAdmin } from "@/lib/supabase/server";
@@ -13,917 +13,121 @@ import type {
   ImageSourcePref,
 } from "@/lib/types";
 
-/*
- * IMPORTANT
+/**
+ * Facebook Auto Bot
  * ------------------------------------------------------------
- * Do NOT statically import sharp.
+ * Image pipeline:
  *
- * Fontconfig must be configured before libvips/Sharp is loaded.
+ * AI:
+ *   Gemini 3.1 Flash Image
+ *       ↓
+ *   Sharp
+ *       ↓
+ *   Caption rendered with exact TTF fontfile
+ *       ↓
+ *   Supabase Storage
  *
- * This file must run in Node.js runtime.
+ * STOCK:
+ *   Pexels
+ *       ↓
+ *   Sharp
+ *       ↓
+ *   Caption rendered with exact TTF fontfile
+ *       ↓
+ *   Supabase Storage
+ *
+ * IMPORTANT:
+ * ------------------------------------------------------------
+ * Caption is NOT rendered using SVG <text>.
+ *
+ * Sharp's text renderer is used directly with:
+ *
+ *   fontfile: absolute path to DejaVuSans-Bold.ttf
+ *
+ * This prevents Windows/Vercel font fallback differences.
+ * ------------------------------------------------------------
  */
-
-import type sharpType from "sharp";
-
-// ============================================================
-// CONSTANTS
-// ============================================================
 
 const STORAGE_BUCKET = "post-images";
 
-const GEMINI_IMAGE_MODEL =
-  "gemini-3.1-flash-image";
-
+const GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image";
 const GEMINI_IMAGE_ENDPOINT =
   "https://generativelanguage.googleapis.com/v1beta/interactions";
-
-const GEMINI_TIMEOUT_MS = 90_000;
-const PEXELS_TIMEOUT_MS = 20_000;
-const TWEMOJI_TIMEOUT_MS = 10_000;
 
 const FINAL_WIDTH = 1080;
 const FINAL_HEIGHT = 1080;
 
-/*
- * Headline overlay tuning.
- */
-const HEADLINE_MAX_CHARS = 22;
-const HEADLINE_MAX_LINES = 4;
+const GEMINI_TIMEOUT_MS = 90_000;
+const PEXELS_TIMEOUT_MS = 20_000;
 
-/*
- * Font file used for the headline overlay.
+const FONT_FILE_NAME = "DejaVuSans-Bold.ttf";
+
+/**
+ * ------------------------------------------------------------
+ * FONT
+ * ------------------------------------------------------------
  *
- * Font ini di-embed langsung ke dalam SVG sebagai Base64
- * via @font-face supaya librsvg (Sharp) TIDAK bergantung
- * pada fontconfig sistem — yang sering gagal di Vercel.
+ * Primary location:
+ *
+ *   <project-root>/fonts/DejaVuSans-Bold.ttf
+ *
+ * Additional fallbacks are included for local development.
  */
-const HEADLINE_FONT_FILE = "DejaVuSans-Bold.ttf";
 
-// ============================================================
-// SHARP LOADER
-// ============================================================
+function findFontFile(): string | null {
+  const candidates = [
+    // Vercel / project root
+    path.join(process.cwd(), "fonts", FONT_FILE_NAME),
 
-let sharpInstance:
-  | typeof sharpType
-  | null = null;
+    // Public folder fallback
+    path.join(process.cwd(), "public", "fonts", FONT_FILE_NAME),
 
-async function getSharp(): Promise<
-  typeof sharpType
-> {
-  if (sharpInstance) {
-    return sharpInstance;
-  }
+    // src/lib -> project root fallback
+    path.join(process.cwd(), "..", "..", "fonts", FONT_FILE_NAME),
 
-  /*
-   * MUST happen before importing sharp/libvips.
-   *
-   * Meskipun kita sudah embed font via Base64 (yang jadi
-   * jalur utama), fontconfig tetap dikonfigurasi sebagai
-   * fallback dan untuk mencegah warning libvips.
-   */
-  configureServerlessFonts();
+    // Linux system font
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 
-  const module =
-    await import("sharp");
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
 
-  sharpInstance =
-    module.default;
-
-  return sharpInstance;
-}
-
-// ============================================================
-// SERVERLESS FONT CONFIG
-// (Fallback — jalur utama sekarang via Base64 @font-face)
-// ============================================================
-
-let fontConfigured = false;
-
-function configureServerlessFonts(): void {
-  if (fontConfigured) {
-    return;
-  }
-
-  try {
-    const projectRoot =
-      process.cwd();
-
-    const fontsDir =
-      path.join(
-        projectRoot,
-        "fonts"
-      );
-
-    const bundledFont =
-      path.join(
-        fontsDir,
-        HEADLINE_FONT_FILE
-      );
-
-    /*
-     * Vercel/serverless writable directory.
-     */
-    const cacheDir =
-      path.join(
-        os.tmpdir(),
-        "facebook-auto-bot-fontconfig"
-      );
-
-    const fontConfigDir =
-      path.join(
-        os.tmpdir(),
-        "facebook-auto-bot-fontconfig-config"
-      );
-
-    const fontsConf =
-      path.join(
-        fontConfigDir,
-        "fonts.conf"
-      );
-
-    fs.mkdirSync(
-      cacheDir,
-      {
-        recursive: true,
-      }
-    );
-
-    fs.mkdirSync(
-      fontConfigDir,
-      {
-        recursive: true,
-      }
-    );
-
-    if (
-      !fs.existsSync(
-        fontsDir
-      )
-    ) {
-      console.warn(
-        `[IMAGE] Fonts directory not found: ${fontsDir}`
-      );
-    }
-
-    if (
-      !fs.existsSync(
-        bundledFont
-      )
-    ) {
-      console.warn(
-        `[IMAGE] Bundled font not found: ${bundledFont}. ` +
-          `Base64 @font-face embedding will be used as fallback.`
-      );
-    }
-
-    /*
-     * Keep XML simple and absolute.
-     */
-    const fontConfigXml =
-      `<?xml version="1.0"?>` +
-      `<!DOCTYPE fontconfig SYSTEM "fonts.dtd">` +
-      `<fontconfig>` +
-      `<dir>${escapeXml(
-        fontsDir
-      )}</dir>` +
-      `<cachedir>${escapeXml(
-        cacheDir
-      )}</cachedir>` +
-      `<match target="pattern">` +
-      `<test name="family">` +
-      `<string>HeadlineFont</string>` +
-      `</test>` +
-      `<edit name="family" mode="prepend" binding="strong">` +
-      `<string>DejaVu Sans</string>` +
-      `</edit>` +
-      `</match>` +
-      `<match target="pattern">` +
-      `<test name="family">` +
-      `<string>Arial</string>` +
-      `</test>` +
-      `<edit name="family" mode="prepend" binding="strong">` +
-      `<string>DejaVu Sans</string>` +
-      `</edit>` +
-      `</match>` +
-      `<match target="pattern">` +
-      `<test name="family">` +
-      `<string>Helvetica</string>` +
-      `</test>` +
-      `<edit name="family" mode="prepend" binding="strong">` +
-      `<string>DejaVu Sans</string>` +
-      `</edit>` +
-      `</match>` +
-      `</fontconfig>`;
-
-    fs.writeFileSync(
-      fontsConf,
-      fontConfigXml,
-      "utf8"
-    );
-
-    /*
-     * These variables need to exist before libvips/fontconfig
-     * starts resolving fonts.
-     */
-    process.env.FONTCONFIG_PATH =
-      fontConfigDir;
-
-    process.env.FONTCONFIG_FILE =
-      fontsConf;
-
-    fontConfigured = true;
-
-    console.info(
-      `[IMAGE] Fontconfig configured`
-    );
-
-    console.info(
-      `[IMAGE] Font directory=${fontsDir}`
-    );
-
-    console.info(
-      `[IMAGE] Font config=${fontsConf}`
-    );
-
-    console.info(
-      `[IMAGE] Bundled font exists=${fs.existsSync(
-        bundledFont
-      )}`
-    );
-  } catch (error) {
-    fontConfigured = false;
-
-    console.warn(
-      "[IMAGE] Fontconfig configuration failed:",
-      error
-    );
-  }
-}
-
-// ============================================================
-// FONT BASE64 LOADER (JALUR UTAMA UNTUK VERCEL)
-// ============================================================
-//
-// Membaca file TTF dan mengubahnya menjadi string Base64
-// yang akan di-embed langsung ke dalam SVG via @font-face.
-//
-// Dengan cara ini, librsvg TIDAK perlu mencari font di
-// sistem fontconfig — sehingga headline selalu dirender
-// dengan benar di lingkungan serverless seperti Vercel.
-// ============================================================
-
-let cachedFontBase64: string | null = null;
-let cachedFontError = false;
-
-function getFontBase64(): string {
-  if (cachedFontBase64 !== null) {
-    return cachedFontBase64;
-  }
-
-  if (cachedFontError) {
-    return "";
-  }
-
-  try {
-    const fontPath = path.join(
-      process.cwd(),
-      "fonts",
-      HEADLINE_FONT_FILE
-    );
-
-    console.info(
-      `[IMAGE] Attempting to load font from: ${fontPath}`
-    );
-
-    if (!fs.existsSync(fontPath)) {
-      console.error(
-        `[IMAGE] CRITICAL: Font file NOT FOUND at ${fontPath}. ` +
-          `Headline akan dirender tanpa font (tofu boxes). ` +
-          `Pastikan file fonts/${HEADLINE_FONT_FILE} ter-commit ` +
-          `ke Git dan outputFileTracingIncludes sudah benar ` +
-          `di next.config.js.`
-      );
-
-      cachedFontError = true;
-      cachedFontBase64 = "";
-      return "";
-    }
-
-    const fontBuffer =
-      fs.readFileSync(fontPath);
-
-    if (fontBuffer.length === 0) {
-      console.error(
-        `[IMAGE] CRITICAL: Font file at ${fontPath} is empty.`
-      );
-
-      cachedFontError = true;
-      cachedFontBase64 = "";
-      return "";
-    }
-
-    cachedFontBase64 =
-      fontBuffer.toString("base64");
-
-    console.info(
-      `[IMAGE] Font loaded as Base64 (raw=${fontBuffer.length} bytes, base64=${cachedFontBase64.length} chars)`
-    );
-
-    return cachedFontBase64;
-  } catch (error) {
-    console.error(
-      `[IMAGE] Failed to load font file:`,
-      error
-    );
-
-    cachedFontError = true;
-    cachedFontBase64 = "";
-    return "";
-  }
-}
-
-// ============================================================
-// SOURCE RESOLUTION
-// ============================================================
-
-export function resolveImageSource(
-  pref: ImageSourcePref
-): ImageSource {
-  if (pref === "mixed") {
-    return Math.random() < 0.5
-      ? "ai"
-      : "stock";
-  }
-
-  return pref;
-}
-
-// ============================================================
-// VISUAL STYLE
-// ============================================================
-
-const PHOTO_STYLE = [
-  "photorealistic",
-  "professional photography",
-  "natural lighting",
-  "realistic details",
-  "high detail",
-  "clean composition",
-  "single scene",
-  "single image",
-  "no watermark",
-  "no logo",
-  "no text",
-  "no letters",
-  "no typography",
-  "no collage",
-  "no grid",
-].join(", ");
-
-// ============================================================
-// VISUAL CATEGORY DETECTION
-// ============================================================
-
-type VisualDetection = {
-  category: string;
-  subject: string;
-  keywords: string;
-};
-
-function detectVisualCategory(
-  prompt: string
-): VisualDetection {
-  const text =
-    prompt
-      .toLowerCase()
-      .replace(
-        /[^a-z0-9\s-]/g,
-        " "
-      )
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim();
-
-  const rules: Array<{
-    category: string;
-    keywords: string[];
-    subject: string;
-    visual: string;
-  }> = [
-    {
-      category: "FOOD",
-      keywords: [
-        "food",
-        "foods",
-        "foodie",
-        "cuisine",
-        "dish",
-        "meal",
-        "recipe",
-        "cooking",
-        "cook",
-        "restaurant",
-        "dining",
-        "eat",
-        "eating",
-        "street food",
-        "fast food",
-        "dessert",
-        "cake",
-        "pizza",
-        "burger",
-        "noodle",
-        "ramen",
-        "sushi",
-        "coffee",
-        "drink",
-        "beverage",
-        "culinary",
-        "snack",
-        "breakfast",
-        "lunch",
-        "dinner",
-      ],
-      subject:
-        "food and culinary content",
-      visual:
-        "an appetizing food dish as the clear main subject, attractive presentation, realistic ingredients, restaurant or street-food atmosphere, close-up culinary photography",
-    },
-
-    {
-      category: "TRAVEL",
-      keywords: [
-        "travel",
-        "traveling",
-        "travelling",
-        "tour",
-        "tourism",
-        "tourist",
-        "trip",
-        "journey",
-        "vacation",
-        "holiday",
-        "destination",
-        "explore",
-        "exploring",
-        "adventure",
-        "beach",
-        "island",
-        "mountain",
-        "waterfall",
-        "city",
-        "landmark",
-        "hotel",
-        "resort",
-        "airport",
-        "road trip",
-      ],
-      subject:
-        "travel and tourism",
-      visual:
-        "a beautiful travel destination as the clear main subject, scenic landscape or recognizable tourist environment, travel atmosphere, exploration and vacation feeling, professional travel photography",
-    },
-
-    {
-      category: "TECHNOLOGY",
-      keywords: [
-        "technology",
-        "tech",
-        "gadget",
-        "smartphone",
-        "phone",
-        "iphone",
-        "android",
-        "computer",
-        "laptop",
-        "software",
-        "ai",
-        "artificial intelligence",
-        "robot",
-        "internet",
-        "digital",
-        "app",
-        "device",
-        "electronics",
-      ],
-      subject:
-        "technology and digital innovation",
-      visual:
-        "modern technology as the clear main subject, contemporary devices or digital innovation, realistic workspace or technological environment, premium technology photography",
-    },
-
-    {
-      category: "HEALTH",
-      keywords: [
-        "health",
-        "healthy",
-        "wellness",
-        "fitness",
-        "exercise",
-        "workout",
-        "gym",
-        "nutrition",
-        "diet",
-        "healthcare",
-        "medical",
-        "doctor",
-        "medicine",
-        "wellbeing",
-        "lifestyle",
-      ],
-      subject:
-        "health and wellness",
-      visual:
-        "a realistic healthy lifestyle scene as the clear main subject, healthy food, exercise, wellness activity, or appropriate healthcare context depending on the topic",
-    },
-
-    {
-      category: "FASHION",
-      keywords: [
-        "fashion",
-        "style",
-        "clothing",
-        "outfit",
-        "dress",
-        "shoes",
-        "sneakers",
-        "beauty",
-        "makeup",
-        "model",
-        "designer",
-        "trend",
-        "trendy",
-      ],
-      subject:
-        "fashion and style",
-      visual:
-        "fashion and style as the clear main subject, contemporary clothing or styling, realistic editorial photography, attractive modern presentation",
-    },
-
-    {
-      category: "SPORTS",
-      keywords: [
-        "sport",
-        "sports",
-        "football",
-        "soccer",
-        "basketball",
-        "tennis",
-        "baseball",
-        "boxing",
-        "running",
-        "athlete",
-        "olympic",
-        "fitness",
-        "match",
-        "game",
-      ],
-      subject:
-        "sports and athletic activity",
-      visual:
-        "a realistic sports scene with the relevant athletic activity as the clear main subject, dynamic action, authentic sporting environment, professional sports photography",
-    },
-
-    {
-      category: "NATURE",
-      keywords: [
-        "nature",
-        "wildlife",
-        "animal",
-        "animals",
-        "forest",
-        "jungle",
-        "lake",
-        "river",
-        "ocean",
-        "sunset",
-        "sunrise",
-        "garden",
-        "flower",
-        "flowers",
-        "landscape",
-      ],
-      subject:
-        "nature and environment",
-      visual:
-        "a beautiful natural environment or relevant wildlife as the clear main subject, realistic landscape photography, natural atmosphere and detailed scenery",
-    },
-
-    {
-      category: "BUSINESS",
-      keywords: [
-        "business",
-        "finance",
-        "money",
-        "market",
-        "marketing",
-        "startup",
-        "entrepreneur",
-        "company",
-        "investment",
-        "economy",
-        "office",
-        "career",
-        "work",
-        "job",
-      ],
-      subject:
-        "business and professional life",
-      visual:
-        "a realistic professional business scene related to the topic, modern workplace, professional people or relevant financial/business environment, editorial business photography",
-    },
+    "/usr/local/share/fonts/DejaVuSans-Bold.ttf",
   ];
 
-  /*
-   * Sort longest keyword first.
-   *
-   * Example:
-   * "street food" should be tested before "food".
-   */
-  const sortedRules =
-    rules.map(
-      (rule) => ({
-        ...rule,
-        keywords: [
-          ...rule.keywords,
-        ].sort(
-          (a, b) =>
-            b.length -
-            a.length
-        ),
-      })
-    );
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        const stat = fs.statSync(candidate);
 
-  for (const rule of sortedRules) {
-    for (const keyword of rule.keywords) {
-      const escaped =
-        keyword.replace(
-          /[.*+?^${}()|[\]\\]/g,
-          "\\$&"
-        );
-
-      const regex =
-        new RegExp(
-          `(^|\\s)${escaped}(?=\\s|$)`,
-          "i"
-        );
-
-      if (
-        regex.test(text)
-      ) {
-        return {
-          category:
-            rule.category,
-          subject:
-            rule.subject,
-          keywords:
-            rule.visual,
-        };
+        if (stat.isFile() && stat.size > 10_000) {
+          return candidate;
+        }
       }
+    } catch {
+      // Ignore inaccessible candidates.
     }
   }
 
-  return {
-    category: "GENERAL",
-    subject:
-      "the topic provided",
-    keywords:
-      "a realistic scene directly representing the main subject and meaning of the topic, with the topic's primary object or activity clearly visible",
-  };
+  return null;
 }
 
-// ============================================================
-// GEMINI PROMPT
-// ============================================================
+const FONT_FILE = findFontFile();
 
-function buildVisualPrompt(
-  prompt: string
-): string {
-  const cleanPrompt =
-    prompt.trim();
-
-  const detected =
-    detectVisualCategory(
-      cleanPrompt
-    );
-
-  return [
-    `TOPIC: ${cleanPrompt}`,
-    `VISUAL CATEGORY: ${detected.category}`,
-    `SUBJECT: ${detected.subject}`,
-    "",
-    "CREATE THIS EXACT VISUAL SUBJECT:",
-    detected.keywords,
-    "",
-    "The image must clearly represent the topic above.",
-    "Do not create a generic lifestyle image when the topic has a specific subject.",
-    "The main subject must be immediately recognizable from the topic.",
-  ].join("\n");
-}
-
-function buildGeminiPrompt(
-  prompt: string,
-  _title: string
-): string {
-  return [
-    "Create a high-quality square social media photograph.",
-    "",
-    buildVisualPrompt(
-      prompt
-    ),
-    "",
-    "IMPORTANT:",
-    "- The TOPIC controls the visual subject.",
-    "- Match the image directly to the topic.",
-    "- If the topic is food, show food.",
-    "- If the topic is travel, show travel, a destination, scenery, or tourism.",
-    "- If the topic is technology, show technology.",
-    "- If the topic is health, show health or wellness.",
-    "- Do NOT substitute an unrelated subject.",
-    "- Create the image only.",
-    "- Do NOT add text, letters, words, captions, headlines, typography, signs, labels, logos, or watermarks.",
-    "- The Facebook headline will be added separately by Sharp.",
-    "",
-    "VISUAL STYLE:",
-    PHOTO_STYLE,
-    "",
-    "COMPOSITION:",
-    "- 1:1 square composition.",
-    "- Designed for a Facebook mobile feed.",
-    "- Strong visual hierarchy.",
-    "- Main subject must remain visually dominant.",
-    "- Professional social-media photography aesthetic.",
-  ].join("\n");
-}
-
-// ============================================================
-// PEXELS QUERY
-// ============================================================
-
-function buildPexelsQuery(
-  prompt: string
-): string {
-  const detected =
-    detectVisualCategory(
-      prompt
-    );
-
-  const categoryQuery: Record<
-    string,
-    string
-  > = {
-    FOOD:
-      "food culinary delicious dish",
-    TRAVEL:
-      "travel destination tourism landscape",
-    TECHNOLOGY:
-      "technology gadgets digital",
-    HEALTH:
-      "healthy lifestyle wellness fitness",
-    FASHION:
-      "fashion style clothing",
-    SPORTS:
-      "sports athlete action",
-    NATURE:
-      "nature landscape wildlife",
-    BUSINESS:
-      "business professional office",
-    GENERAL:
-      "lifestyle",
-  };
-
-  const categoryBase =
-    categoryQuery[
-      detected.category
-    ] ??
-    "lifestyle";
-
-  const topicText =
-    prompt
-      .replace(
-        /^a\s+realistic\s+cinematic\s+photograph\s+related\s+to\s+/i,
-        " "
-      )
-      .replace(
-        /^a\s+realistic\s+photograph\s+related\s+to\s+/i,
-        " "
-      )
-      .replace(
-        /visually compelling composition/gi,
-        " "
-      )
-      .replace(
-        /natural lighting/gi,
-        " "
-      )
-      .replace(
-        /high detail/gi,
-        " "
-      )
-      .replace(
-        /realistic photography/gi,
-        " "
-      )
-      .replace(
-        /professional facebook social media design/gi,
-        " "
-      )
-      .replace(
-        /1:1 square composition/gi,
-        " "
-      )
-      .replace(
-        /bold overlay text/gi,
-        " "
-      )
-      .replace(
-        /centered near the bottom/gi,
-        " "
-      )
-      .replace(
-        /large modern bold typography/gi,
-        " "
-      )
-      .replace(
-        /subtle dark contrast box/gi,
-        " "
-      )
-      .replace(
-        /highly readable on a mobile screen/gi,
-        " "
-      )
-      .replace(
-        /no hashtags|no url|no logo|no watermark|no text|no letters|no words|no captions|no headlines|no typography/gi,
-        " "
-      )
-      .replace(
-        /[^a-zA-Z0-9À-ÿ\s-]/g,
-        " "
-      )
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim();
-
-  const topicWords =
-    topicText
-      .split(/\s+/)
-      .filter(Boolean);
-
-  const genericWords =
-    new Set([
-      "today",
-      "new",
-      "latest",
-      "viral",
-      "worth",
-      "look",
-      "must",
-      "see",
-      "interesting",
-      "amazing",
-      "beautiful",
-      "best",
-      "news",
-      "trending",
-      "trend",
-    ]);
-
-  const usefulWords =
-    topicWords
-      .filter(
-        (word) =>
-          !genericWords.has(
-            word.toLowerCase()
-          )
-      )
-      .slice(0, 6);
-
-  const query = [
-    categoryBase,
-    ...usefulWords,
-  ]
-    .join(" ")
-    .trim();
-
-  console.info(
-    `[IMAGE] Visual category=${detected.category} Pexels query="${query}"`
-  );
-
-  return (
-    query ||
-    categoryBase
+if (FONT_FILE) {
+  console.log(`[image] Caption font: ${FONT_FILE}`);
+} else {
+  console.warn(
+    `[image] WARNING: ${FONT_FILE_NAME} not found. ` +
+      `Caption rendering will use system font fallback.`
   );
 }
 
-// ============================================================
-// GEMINI IMAGE GENERATION
-// ============================================================
+/**
+ * ------------------------------------------------------------
+ * TYPES
+ * ------------------------------------------------------------
+ */
 
-type GeminiImageResponse = {
+interface GeminiImageResponse {
   output_image?: {
     data?: string;
     mime_type?: string;
@@ -933,1574 +137,1393 @@ type GeminiImageResponse = {
     type?: string;
     content?: Array<{
       type?: string;
+      image?: {
+        data?: string;
+        mime_type?: string;
+      };
       data?: string;
       mime_type?: string;
     }>;
   }>;
+}
+
+interface PexelsPhoto {
+  width?: number;
+  height?: number;
+
+  src?: {
+    original?: string;
+    large2x?: string;
+    large?: string;
+    medium?: string;
+  };
+}
+
+interface PexelsResponse {
+  photos?: PexelsPhoto[];
+}
+
+/**
+ * ------------------------------------------------------------
+ * CATEGORY DETECTION
+ * ------------------------------------------------------------
+ */
+
+type VisualCategory =
+  | "FOOD"
+  | "TRAVEL"
+  | "TECHNOLOGY"
+  | "HEALTH"
+  | "FASHION"
+  | "SPORTS"
+  | "NATURE"
+  | "BUSINESS"
+  | "GENERAL";
+
+const CATEGORY_KEYWORDS: Record<
+  Exclude<VisualCategory, "GENERAL">,
+  string[]
+> = {
+  FOOD: [
+    "restaurant",
+    "cooking",
+    "recipe",
+    "cuisine",
+    "food",
+    "meal",
+    "dinner",
+    "lunch",
+    "breakfast",
+    "dessert",
+    "cake",
+    "coffee",
+    "drink",
+    "chef",
+    "kitchen",
+  ],
+
+  TRAVEL: [
+    "destination",
+    "vacation",
+    "holiday",
+    "travel",
+    "tourism",
+    "beach",
+    "mountain",
+    "hotel",
+    "island",
+    "airport",
+    "trip",
+    "city",
+  ],
+
+  TECHNOLOGY: [
+    "artificial intelligence",
+    "machine learning",
+    "smartphone",
+    "computer",
+    "technology",
+    "software",
+    "robot",
+    "digital",
+    "internet",
+    "app",
+    "coding",
+    "programming",
+    "ai",
+  ],
+
+  HEALTH: [
+    "mental health",
+    "health",
+    "fitness",
+    "exercise",
+    "nutrition",
+    "wellness",
+    "doctor",
+    "medical",
+    "medicine",
+    "sleep",
+    "workout",
+    "healthy",
+  ],
+
+  FASHION: [
+    "fashion",
+    "clothing",
+    "outfit",
+    "dress",
+    "style",
+    "beauty",
+    "makeup",
+    "skincare",
+    "shoes",
+    "jewelry",
+    "model",
+  ],
+
+  SPORTS: [
+    "football",
+    "soccer",
+    "basketball",
+    "tennis",
+    "baseball",
+    "sports",
+    "athlete",
+    "running",
+    "cycling",
+    "gym",
+    "match",
+    "championship",
+  ],
+
+  NATURE: [
+    "nature",
+    "forest",
+    "mountain",
+    "ocean",
+    "sea",
+    "lake",
+    "river",
+    "wildlife",
+    "animal",
+    "garden",
+    "sunset",
+    "landscape",
+  ],
+
+  BUSINESS: [
+    "business",
+    "marketing",
+    "startup",
+    "entrepreneur",
+    "finance",
+    "money",
+    "investment",
+    "company",
+    "office",
+    "career",
+    "work",
+    "leadership",
+  ],
 };
 
-async function fetchGeminiImageBytes(
-  prompt: string,
-  title: string
-): Promise<Blob> {
-  const apiKey =
-    env.geminiApiKey;
+function detectCategory(text: string): VisualCategory {
+  const normalized = text.toLowerCase();
 
-  if (!apiKey) {
-    throw new Error(
-      "GEMINI_API_KEY is not configured."
-    );
-  }
+  let bestCategory: VisualCategory = "GENERAL";
+  let bestScore = 0;
 
-  const cleanTitle =
-    cleanHeadline(title);
+  for (const [category, keywords] of Object.entries(
+    CATEGORY_KEYWORDS
+  )) {
+    let score = 0;
 
-  if (!cleanTitle) {
-    throw new Error(
-      "Facebook headline is required before Gemini image generation."
-    );
-  }
-
-  const finalPrompt =
-    buildGeminiPrompt(
-      prompt,
-      cleanTitle
-    );
-
-  console.info(
-    `[IMAGE] Gemini starting model=${GEMINI_IMAGE_MODEL}`
-  );
-
-  const requestBody = {
-    model:
-      GEMINI_IMAGE_MODEL,
-
-    input: [
-      {
-        type: "text",
-        text: finalPrompt,
-      },
-    ],
-
-    response_format: {
-      type: "image",
-      mime_type: "image/jpeg",
-      aspect_ratio: "1:1",
-      image_size: "1K",
-    },
-  };
-
-  let response: Response;
-
-  try {
-    response =
-      await fetch(
-        GEMINI_IMAGE_ENDPOINT,
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json",
-            "x-goog-api-key":
-              apiKey,
-          },
-
-          body:
-            JSON.stringify(
-              requestBody
-            ),
-
-          signal:
-            AbortSignal.timeout(
-              GEMINI_TIMEOUT_MS
-            ),
-        }
-      );
-  } catch (error) {
-    if (
-      error instanceof
-      DOMException
-    ) {
-      throw new Error(
-        "Gemini image request timed out."
-      );
+    for (const keyword of keywords) {
+      if (normalized.includes(keyword)) {
+        score += keyword.length >= 8 ? 2 : 1;
+      }
     }
 
-    throw error;
+    if (score > bestScore) {
+      bestScore = score;
+      bestCategory = category as VisualCategory;
+    }
   }
 
-  const body =
-    await response.text();
+  return bestCategory;
+}
 
-  console.info(
-    `[IMAGE] Gemini HTTP ${response.status}`
+/**
+ * ------------------------------------------------------------
+ * FETCH WITH TIMEOUT
+ * ------------------------------------------------------------
+ */
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * ------------------------------------------------------------
+ * GEMINI IMAGE PROMPT
+ * ------------------------------------------------------------
+ */
+
+function buildGeminiPrompt(
+  prompt: string,
+  title?: string
+): string {
+  const category = detectCategory(
+    `${title ?? ""} ${prompt}`
+  );
+
+  return `
+Create a photorealistic, premium social-media image for a Facebook post.
+
+Topic:
+${prompt}
+
+${title ? `Headline context: ${title}` : ""}
+
+Visual category:
+${category}
+
+Requirements:
+- Square composition.
+- 1:1 aspect ratio.
+- Professional editorial photography.
+- Strong visual hierarchy.
+- High contrast.
+- Natural realistic lighting.
+- Clean composition.
+- Subject should be immediately understandable.
+- Suitable for a Facebook feed.
+- Leave enough visual breathing room for a headline overlay.
+- No text inside the generated image.
+- No captions.
+- No typography.
+- No logos.
+- No watermark.
+- No fake UI.
+- No letters.
+- No numbers.
+- No words.
+- Do not create a poster.
+- Do not create an advertisement containing text.
+
+The headline will be rendered separately by the application.
+
+Generate only the image.
+`.trim();
+}
+
+/**
+ * ------------------------------------------------------------
+ * GEMINI IMAGE GENERATION
+ * ------------------------------------------------------------
+ */
+
+async function generateWithGemini(
+  prompt: string,
+  title?: string
+): Promise<Buffer> {
+  const apiKey = env.geminiApiKey;
+
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is not configured.");
+  }
+
+  const finalPrompt = buildGeminiPrompt(prompt, title);
+
+  const response = await fetchWithTimeout(
+    GEMINI_IMAGE_ENDPOINT,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        model: GEMINI_IMAGE_MODEL,
+
+        input: [
+          {
+            type: "text",
+            text: finalPrompt,
+          },
+        ],
+
+        response_format: {
+          type: "image",
+          mime_type: "image/jpeg",
+          aspect_ratio: "1:1",
+          image_size: "1K",
+        },
+      }),
+    },
+    GEMINI_TIMEOUT_MS
   );
 
   if (!response.ok) {
-    console.error(
-      "[IMAGE] Gemini API error:",
-      body.slice(0, 2000)
-    );
+    const errorText = await response.text();
 
     throw new Error(
-      `Gemini image API HTTP ${response.status}: ${body.slice(
+      `Gemini image generation failed (${response.status}): ${errorText.slice(
         0,
-        800
+        1000
       )}`
     );
   }
 
-  let data:
-    | GeminiImageResponse
-    | null = null;
+  const data =
+    (await response.json()) as GeminiImageResponse;
 
-  try {
-    data =
-      JSON.parse(
-        body
-      ) as GeminiImageResponse;
-  } catch {
-    console.error(
-      "[IMAGE] Gemini returned non-JSON:",
-      body.slice(0, 1000)
-    );
+  /**
+   * Format 1:
+   *
+   * output_image.data
+   */
+  const directImage = data.output_image?.data;
 
-    throw new Error(
-      "Gemini returned invalid JSON."
-    );
+  if (directImage) {
+    return Buffer.from(directImage, "base64");
   }
 
-  /*
-   * Primary documented response.
+  /**
+   * Format 2:
+   *
+   * steps[].content[].image.data
    */
-  if (
-    typeof data?.output_image
-      ?.data ===
-      "string" &&
-    data.output_image.data.length >
-      0
-  ) {
-    const mimeType =
-      typeof data.output_image
-        .mime_type ===
-      "string"
-        ? data.output_image
-            .mime_type
-        : "image/jpeg";
-
-    const bytes =
-      Buffer.from(
-        data.output_image.data,
-        "base64"
-      );
-
-    if (
-      bytes.length === 0
-    ) {
-      throw new Error(
-        "Gemini returned empty image data."
-      );
-    }
-
-    console.info(
-      `[IMAGE] Gemini SUCCESS output_image bytes=${bytes.length}`
-    );
-
-    return new Blob(
-      [bytes],
-      {
-        type: mimeType,
+  for (const step of data.steps ?? []) {
+    for (const content of step.content ?? []) {
+      if (content.image?.data) {
+        return Buffer.from(
+          content.image.data,
+          "base64"
+        );
       }
-    );
-  }
 
-  /*
-   * Compatibility fallback for model-output steps.
-   */
-  if (
-    Array.isArray(
-      data?.steps
-    )
-  ) {
-    for (const step of data.steps) {
       if (
-        !Array.isArray(
-          step?.content
-        )
+        content.type === "image" &&
+        content.data
       ) {
-        continue;
-      }
-
-      for (const item of step.content) {
-        if (
-          item?.type !==
-          "image"
-        ) {
-          continue;
-        }
-
-        if (
-          typeof item.data !==
-          "string" ||
-          !item.data
-        ) {
-          continue;
-        }
-
-        const bytes =
-          Buffer.from(
-            item.data,
-            "base64"
-          );
-
-        if (
-          bytes.length === 0
-        ) {
-          continue;
-        }
-
-        const mimeType =
-          typeof item.mime_type ===
-          "string"
-            ? item.mime_type
-            : "image/jpeg";
-
-        console.info(
-          `[IMAGE] Gemini SUCCESS steps image bytes=${bytes.length}`
-        );
-
-        return new Blob(
-          [bytes],
-          {
-            type: mimeType,
-          }
+        return Buffer.from(
+          content.data,
+          "base64"
         );
       }
     }
   }
-
-  console.error(
-    "[IMAGE] Gemini response contained no image."
-  );
-
-  console.error(
-    "[IMAGE] Gemini response keys:",
-    Object.keys(
-      data ?? {}
-    )
-  );
 
   throw new Error(
-    "Gemini completed but returned no image data."
+    "Gemini returned successfully but no image data was found."
   );
 }
 
-// ============================================================
-// PEXELS
-// ============================================================
+/**
+ * ------------------------------------------------------------
+ * PEXELS QUERY
+ * ------------------------------------------------------------
+ */
 
-type PexelsPhoto = {
-  src?: {
-    large2x?: string;
-    large?: string;
-    original?: string;
+function buildPexelsQuery(
+  prompt: string,
+  title?: string
+): string {
+  const category = detectCategory(
+    `${title ?? ""} ${prompt}`
+  );
+
+  const categoryQueries: Record<
+    VisualCategory,
+    string
+  > = {
+    FOOD: "food cooking restaurant meal",
+    TRAVEL: "travel destination landscape",
+    TECHNOLOGY: "technology computer digital",
+    HEALTH: "health wellness fitness",
+    FASHION: "fashion lifestyle model",
+    SPORTS: "sports athlete action",
+    NATURE: "nature landscape outdoors",
+    BUSINESS: "business office professional",
+    GENERAL: "lifestyle professional editorial",
   };
-};
 
-type PexelsResponse = {
-  photos?: PexelsPhoto[];
-};
+  const cleaned = `${title ?? ""} ${prompt}`
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-async function fetchStockImageBytes(
-  prompt: string
-): Promise<Blob> {
-  const apiKey =
-    env.pexelsApiKey;
+  /**
+   * Keep query short.
+   * Pexels works better with concise keywords.
+   */
+  const words = cleaned
+    .split(" ")
+    .filter(Boolean)
+    .slice(0, 6);
+
+  return `${words.join(" ")} ${categoryQueries[category]}`
+    .trim()
+    .slice(0, 180);
+}
+
+/**
+ * ------------------------------------------------------------
+ * PEXELS IMAGE
+ * ------------------------------------------------------------
+ */
+
+async function generateWithPexels(
+  prompt: string,
+  title?: string
+): Promise<Buffer> {
+  const apiKey = env.pexelsApiKey;
 
   if (!apiKey) {
-    throw new Error(
-      "PEXELS_API_KEY is not configured."
-    );
+    throw new Error("PEXELS_API_KEY is not configured.");
   }
 
-  const query =
-    buildPexelsQuery(
-      prompt
-    );
-
-  console.info(
-    `[IMAGE] Pexels query="${query}"`
+  const query = buildPexelsQuery(
+    prompt,
+    title
   );
 
-  const searchUrl =
-    new URL(
-      "https://api.pexels.com/v1/search"
-    );
+  const url =
+    "https://api.pexels.com/v1/search?" +
+    new URLSearchParams({
+      query,
+      orientation: "square",
+      size: "large",
+      per_page: "15",
+    }).toString();
 
-  searchUrl.searchParams.set(
-    "query",
-    query
-  );
-
-  searchUrl.searchParams.set(
-    "orientation",
-    "square"
-  );
-
-  searchUrl.searchParams.set(
-    "size",
-    "large"
-  );
-
-  searchUrl.searchParams.set(
-    "per_page",
-    "15"
-  );
-
-  const response =
-    await fetch(
-      searchUrl.toString(),
-      {
-        method: "GET",
-
-        headers: {
-          Authorization:
-            apiKey,
-        },
-
-        signal:
-          AbortSignal.timeout(
-            PEXELS_TIMEOUT_MS
-          ),
-      }
-    );
-
-  const body =
-    await response.text();
-
-  console.info(
-    `[IMAGE] Pexels HTTP ${response.status}`
+  const response = await fetchWithTimeout(
+    url,
+    {
+      method: "GET",
+      headers: {
+        Authorization: apiKey,
+      },
+    },
+    PEXELS_TIMEOUT_MS
   );
 
   if (!response.ok) {
-    console.error(
-      "[IMAGE] Pexels API error:",
-      body.slice(0, 1000)
-    );
+    const errorText = await response.text();
 
     throw new Error(
-      `Pexels HTTP ${response.status}: ${body.slice(
+      `Pexels request failed (${response.status}): ${errorText.slice(
         0,
         500
       )}`
     );
   }
 
-  let data:
-    | PexelsResponse
-    | null = null;
+  const data =
+    (await response.json()) as PexelsResponse;
 
-  try {
-    data =
-      JSON.parse(
-        body
-      ) as PexelsResponse;
-  } catch {
-    throw new Error(
-      "Pexels returned invalid JSON."
-    );
-  }
-
-  const photos =
-    Array.isArray(
-      data?.photos
-    )
-      ? data.photos
-      : [];
-
-  if (
-    photos.length === 0
-  ) {
-    throw new Error(
-      `Pexels returned no photos for query "${query}".`
-    );
-  }
-
-  const validPhotos =
-    photos.filter(
-      (photo) =>
-        typeof photo?.src
-          ?.large2x ===
-          "string" ||
-        typeof photo?.src
-          ?.large ===
-          "string" ||
-        typeof photo?.src
-          ?.original ===
-          "string"
-    );
-
-  if (
-    validPhotos.length === 0
-  ) {
-    throw new Error(
-      "Pexels returned photos without usable URLs."
-    );
-  }
-
-  const selected =
-    validPhotos[
-      Math.floor(
-        Math.random() *
-          validPhotos.length
+  const photos = (data.photos ?? []).filter(
+    (photo) =>
+      Boolean(
+        photo.src?.large2x ||
+          photo.src?.large ||
+          photo.src?.original
       )
+  );
+
+  if (!photos.length) {
+    throw new Error(
+      `Pexels returned no usable images for "${query}".`
+    );
+  }
+
+  /**
+   * Randomize result so repeated posts don't always
+   * use the first Pexels image.
+   */
+  const photo =
+    photos[
+      Math.floor(Math.random() * photos.length)
     ];
 
-  if (!selected) {
-    throw new Error(
-      "Unable to select a Pexels photo."
-    );
-  }
-
   const imageUrl =
-    selected.src?.large2x ??
-    selected.src?.large ??
-    selected.src?.original;
+    photo.src?.large2x ??
+    photo.src?.large ??
+    photo.src?.original;
 
   if (!imageUrl) {
     throw new Error(
-      "Selected Pexels photo has no usable image URL."
+      "Pexels photo has no usable image URL."
     );
   }
 
-  console.info(
-    "[IMAGE] Pexels downloading selected photo"
-  );
-
   const imageResponse =
-    await fetch(
+    await fetchWithTimeout(
       imageUrl,
       {
         method: "GET",
-
-        signal:
-          AbortSignal.timeout(
-            PEXELS_TIMEOUT_MS
-          ),
-      }
+      },
+      PEXELS_TIMEOUT_MS
     );
 
-  if (
-    !imageResponse.ok
-  ) {
+  if (!imageResponse.ok) {
     throw new Error(
-      `Pexels image download HTTP ${imageResponse.status}`
+      `Pexels image download failed (${imageResponse.status}).`
     );
   }
 
-  const blob =
-    await imageResponse.blob();
+  const arrayBuffer =
+    await imageResponse.arrayBuffer();
 
-  if (
-    blob.size === 0
-  ) {
-    throw new Error(
-      "Pexels returned an empty image."
-    );
-  }
-
-  console.info(
-    `[IMAGE] Pexels SUCCESS size=${blob.size} type=${blob.type || "unknown"}`
-  );
-
-  return blob;
+  return Buffer.from(arrayBuffer);
 }
 
-// ============================================================
-// SVG ESCAPE
-// ============================================================
-
-function escapeXml(
-  value: string
-): string {
-  return value
-    .replace(
-      /&/g,
-      "&amp;"
-    )
-    .replace(
-      /</g,
-      "&lt;"
-    )
-    .replace(
-      />/g,
-      "&gt;"
-    )
-    .replace(
-      /"/g,
-      "&quot;"
-    )
-    .replace(
-      /'/g,
-      "&apos;"
-    );
-}
-
-// ============================================================
-// HEADLINE CLEANING
-// ============================================================
+/**
+ * ------------------------------------------------------------
+ * HEADLINE CLEANUP
+ * ------------------------------------------------------------
+ */
 
 function cleanHeadline(
-  title: string
+  value: string | undefined | null
 ): string {
-  return title
-    .trim()
-    .replace(
-      /[\u0000-\u001F\u007F]/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
+  if (!value) {
+    return "";
+  }
+
+  return value
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
     .trim();
 }
 
-// ============================================================
-// HEADLINE WRAPPING
-// ============================================================
+/**
+ * ------------------------------------------------------------
+ * WORD WRAPPING
+ * ------------------------------------------------------------
+ *
+ * Maximum 3 lines.
+ */
 
 function wrapHeadline(
-  title: string,
-  maxChars = HEADLINE_MAX_CHARS
-): string[] {
-  const words =
-    title
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean);
+  headline: string,
+  maxCharsPerLine = 24,
+  maxLines = 3
+): string {
+  const words = headline
+    .split(/\s+/)
+    .filter(Boolean);
 
-  if (
-    words.length === 0
-  ) {
-    return [];
-  }
-
-  const lines: string[] =
-    [];
-
+  const lines: string[] = [];
   let current = "";
 
   for (const word of words) {
+    const candidate = current
+      ? `${current} ${word}`
+      : word;
+
     if (
-      word.length >
-        maxChars &&
+      candidate.length <= maxCharsPerLine ||
       !current
     ) {
-      let remaining = word;
-
-      while (
-        remaining.length >
-        maxChars
-      ) {
-        lines.push(
-          remaining.slice(
-            0,
-            maxChars
-          )
-        );
-
-        remaining =
-          remaining.slice(
-            maxChars
-          );
-      }
-
-      current = remaining;
-
+      current = candidate;
       continue;
     }
 
-    const candidate =
-      current
-        ? `${current} ${word}`
-        : word;
+    lines.push(current);
+    current = word;
 
-    if (
-      candidate.length <=
-      maxChars
-    ) {
-      current = candidate;
-    } else {
-      if (current) {
-        lines.push(
-          current
-        );
-      }
-
-      current = word;
+    if (lines.length === maxLines - 1) {
+      break;
     }
   }
 
-  if (current) {
+  if (current && lines.length < maxLines) {
     lines.push(current);
   }
 
-  if (
-    lines.length <=
-    HEADLINE_MAX_LINES
-  ) {
-    return lines;
-  }
-
-  /*
-   * Rebalance jika melebihi batas baris.
+  /**
+   * If words remain, append an ellipsis.
    */
-  const allWords =
-    lines.join(" ").split(/\s+/);
+  if (lines.length === maxLines) {
+    const usedWords = lines
+      .join(" ")
+      .split(/\s+/).length;
 
-  const totalChars =
-    allWords.reduce(
-      (sum, w) => sum + w.length,
-      0
-    ) + Math.max(0, allWords.length - 1);
-
-  const targetCharsPerLine =
-    Math.ceil(
-      totalChars /
-        HEADLINE_MAX_LINES
-    );
-
-  const rebalanced: string[] =
-    [];
-
-  let buf = "";
-
-  for (const word of allWords) {
-    const candidate =
-      buf ? `${buf} ${word}` : word;
-
-    const isLastLine =
-      rebalanced.length ===
-      HEADLINE_MAX_LINES - 1;
-
-    if (
-      isLastLine ||
-      candidate.length <=
-        targetCharsPerLine
-    ) {
-      buf = candidate;
-    } else {
-      rebalanced.push(buf);
-      buf = word;
+    if (usedWords < words.length) {
+      lines[maxLines - 1] =
+        lines[maxLines - 1]
+          .replace(/[.…]+$/g, "")
+          .trimEnd() + "…";
     }
   }
 
-  if (buf) {
-    rebalanced.push(buf);
-  }
-
-  return rebalanced.slice(
-    0,
-    HEADLINE_MAX_LINES
-  );
+  return lines.join("\n");
 }
 
-// ============================================================
-// TWEMOJI
-// ============================================================
+/**
+ * ------------------------------------------------------------
+ * XML / PANGO ESCAPE
+ * ------------------------------------------------------------
+ */
 
-const TWEMOJI_BASE =
-  "https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/";
+function escapePangoText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
-const EMOJI_REGEX =
-  /(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F|\u200D(?:[\u{1F000}-\u{1FAFF}]|[\u{2600}-\u{27BF}])(?:\uFE0F)?)*|\uFE0F/gu;
+/**
+ * ------------------------------------------------------------
+ * FONT SIZE
+ * ------------------------------------------------------------
+ */
 
-const emojiCache =
-  new Map<
-    string,
-    string
-  >();
+function getHeadlineFontSize(
+  lines: string[]
+): number {
+  const longest = Math.max(
+    ...lines.map((line) => line.length)
+  );
 
-async function emojiDataUri(
-  emoji: string
-): Promise<
-  string | null
-> {
-  let codePoint: string;
-
-  try {
-    codePoint =
-      twemoji.convert
-        .toCodePoint(
-          emoji
-        )
-        .toLowerCase();
-  } catch (error) {
-    console.warn(
-      `[IMAGE] Twemoji conversion failed for "${emoji}":`,
-      error
-    );
-
-    return null;
+  if (lines.length >= 3) {
+    if (longest > 24) return 48;
+    if (longest > 20) return 54;
+    return 60;
   }
+
+  if (longest > 30) return 52;
+  if (longest > 24) return 60;
+  if (longest > 18) return 68;
+
+  return 76;
+}
+
+/**
+ * ------------------------------------------------------------
+ * CREATE TEXT LAYER
+ * ------------------------------------------------------------
+ *
+ * This is the important fix.
+ *
+ * Instead of:
+ *
+ *   SVG <text font-family="HeadlineFont">
+ *
+ * we use:
+ *
+ *   sharp({
+ *     text: {
+ *       fontfile: "/absolute/path/to/font.ttf"
+ *     }
+ *   })
+ *
+ * Sharp officially supports `fontfile` as an absolute
+ * filesystem path. This avoids relying on whichever font
+ * happens to exist on the Vercel Linux runtime.
+ */
+
+async function createTextLayer(
+  text: string,
+  options: {
+    color: string;
+    fontSize: number;
+    width: number;
+    height: number;
+  }
+): Promise<Buffer> {
+  const safeText = escapePangoText(text);
+
+  const fontName = FONT_FILE
+    ? "DejaVu Sans Bold"
+    : "sans Bold";
+
+  const fontDefinition =
+    `${fontName} ${options.fontSize}`;
+
+  const pangoText =
+    `<span foreground="${options.color}">${safeText}</span>`;
+
+  const textInput: Parameters<
+    typeof sharp
+  >[0] = {
+    text: {
+      text: pangoText,
+      font: fontDefinition,
+      width: options.width,
+      height: options.height,
+      align: "center",
+      rgba: true,
+      spacing: 8,
+
+      ...(FONT_FILE
+        ? {
+            fontfile: FONT_FILE,
+          }
+        : {}),
+    },
+  };
+
+  return sharp(textInput)
+    .png()
+    .toBuffer();
+}
+
+/**
+ * ------------------------------------------------------------
+ * TWEMOJI
+ * ------------------------------------------------------------
+ *
+ * We don't use SVG text for the headline anymore.
+ *
+ * Twemoji is only used as an image overlay.
+ */
+
+function getTwemojiCodePoint(
+  value: string
+): string {
+  return [...value]
+    .map((char) => {
+      const code = char
+        .codePointAt(0)
+        ?.toString(16);
+
+      return code ?? "";
+    })
+    .filter(Boolean)
+    .join("-");
+}
+
+async function fetchTwemoji(
+  emoji: string
+): Promise<Buffer | null> {
+  const codePoint =
+    getTwemojiCodePoint(emoji);
 
   if (!codePoint) {
     return null;
   }
 
-  const cached =
-    emojiCache.get(
-      codePoint
-    );
-
-  if (cached) {
-    return cached;
-  }
+  const url =
+    `https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/${codePoint}.svg`;
 
   try {
-    const response =
-      await fetch(
-        `${TWEMOJI_BASE}${codePoint}.svg`,
-        {
-          signal:
-            AbortSignal.timeout(
-              TWEMOJI_TIMEOUT_MS
-            ),
-        }
-      );
+    const response = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          Accept: "image/svg+xml",
+        },
+      },
+      10_000
+    );
 
-    if (
-      !response.ok
-    ) {
-      console.warn(
-        `[IMAGE] Twemoji HTTP ${response.status} for ${emoji}`
-      );
-
+    if (!response.ok) {
       return null;
     }
 
-    const svgText =
-      await response.text();
+    const svg =
+      await response.arrayBuffer();
 
-    if (!svgText) {
-      return null;
-    }
-
-    const dataUri =
-      `data:image/svg+xml;base64,${Buffer.from(
-        svgText,
-        "utf8"
-      ).toString(
-        "base64"
-      )}`;
-
-    emojiCache.set(
-      codePoint,
-      dataUri
-    );
-
-    return dataUri;
-  } catch (error) {
-    console.warn(
-      `[IMAGE] Twemoji fetch failed for ${emoji}:`,
-      error
-    );
-
+    return await sharp(
+      Buffer.from(svg)
+    )
+      .png()
+      .toBuffer();
+  } catch {
     return null;
   }
 }
 
-// ============================================================
-// HEADLINE SVG (FIXED — BASE64 EMBEDDED FONT)
-// ============================================================
-//
-// Perubahan kunci:
-// 1. Font di-embed langsung ke dalam SVG via @font-face
-//    dengan data Base64. Ini memastikan teks SELALU dirender
-//    di Vercel tanpa bergantung pada fontconfig sistem.
-// 2. `paint-order` sebagai ATTRIBUTE SVG (bukan cuma style).
-// 3. Font size menyusut sesuai jumlah baris (78→48).
-// 4. Semua emoji di-render sebagai <image> Twemoji.
-// ============================================================
+/**
+ * ------------------------------------------------------------
+ * SIMPLE EMOJI EXTRACTION
+ * ------------------------------------------------------------
+ *
+ * We deliberately handle the common emoji ranges.
+ * Unknown emoji remain part of the text.
+ */
 
-async function createHeadlineSvg(
-  title: string
+function extractSimpleEmoji(
+  text: string
+): {
+  text: string;
+  emoji: string[];
+} {
+  const emoji: string[] = [];
+
+  const result = text.replace(
+    /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu,
+    (match) => {
+      emoji.push(match);
+      return "";
+    }
+  );
+
+  return {
+    text: result
+      .replace(/\s+/g, " ")
+      .trim(),
+    emoji,
+  };
+}
+
+/**
+ * ------------------------------------------------------------
+ * ADD HEADLINE
+ * ------------------------------------------------------------
+ */
+
+async function addHeadline(
+  image: Buffer,
+  title?: string
 ): Promise<Buffer> {
-  const cleanTitle =
-    cleanHeadline(title);
+  const headline = cleanHeadline(title);
 
-  if (!cleanTitle) {
-    throw new Error(
-      "Headline title is empty after cleaning."
-    );
+  if (!headline) {
+    return image;
   }
 
-  const lines =
-    wrapHeadline(
-      cleanTitle,
-      HEADLINE_MAX_CHARS
-    );
+  const {
+    text: headlineWithoutEmoji,
+    emoji,
+  } = extractSimpleEmoji(headline);
 
-  if (
-    lines.length === 0
-  ) {
-    throw new Error(
-      "Unable to create headline overlay."
-    );
-  }
+  const wrapped = wrapHeadline(
+    headlineWithoutEmoji || headline
+  );
+
+  const lines = wrapped.split("\n");
 
   const fontSize =
-    lines.length === 1
-      ? 78
-      : lines.length === 2
-        ? 66
-        : lines.length === 3
-          ? 56
-          : 48;
+    getHeadlineFontSize(lines);
 
-  const lineHeight =
-    fontSize + 14;
-
-  const totalTextHeight =
-    lines.length *
-    lineHeight;
-
-  const bottomMargin =
-    70;
-
-  const firstTextY =
-    FINAL_HEIGHT -
-    totalTextHeight -
-    bottomMargin;
-
-  const centerX =
-    FINAL_WIDTH / 2;
-
-  /*
-   * Font family name — harus cocok dengan @font-face di bawah.
+  /**
+   * Main text area.
    */
-  const fontFamily =
-    "HeadlineFont";
+  const textWidth = 920;
+  const textHeight =
+    lines.length >= 3 ? 300 : 240;
 
-  const lineElements =
-    await Promise.all(
-      lines.map(
-        async (
-          line,
-          index
-        ) => {
-          const y =
-            firstTextY +
-            index *
-              lineHeight;
-
-          const matches =
-            [
-              ...line.matchAll(
-                EMOJI_REGEX
-              ),
-            ];
-
-          const emojiParts: Array<{
-            emoji: string;
-            charIndex: number;
-          }> = [];
-
-          for (const m of matches) {
-            if (m.index === undefined) {
-              continue;
-            }
-
-            emojiParts.push({
-              emoji: m[0],
-              charIndex: m.index,
-            });
-          }
-
-          /*
-           * Buang semua emoji dari textPart.
-           */
-          let textPart = line;
-
-          if (
-            emojiParts.length > 0
-          ) {
-            let result = "";
-            let cursor = 0;
-
-            for (const p of emojiParts) {
-              result += line.slice(
-                cursor,
-                p.charIndex
-              );
-
-              cursor =
-                p.charIndex +
-                p.emoji.length;
-            }
-
-            result += line.slice(
-              cursor
-            );
-
-            textPart = result
-              .replace(/\s+/g, " ")
-              .trim();
-          }
-
-          const elements: string[] =
-            [];
-
-          /*
-           * ===== TEXT =====
-           */
-          if (textPart) {
-            elements.push(
-              `<text ` +
-                `x="${centerX}" ` +
-                `y="${y}" ` +
-                `text-anchor="middle" ` +
-                `font-family="${fontFamily}" ` +
-                `font-size="${fontSize}px" ` +
-                `font-weight="700" ` +
-                `fill="#FFFFFF" ` +
-                `stroke="#000000" ` +
-                `stroke-width="6" ` +
-                `stroke-linejoin="round" ` +
-                `paint-order="stroke fill" ` +
-                `style="paint-order: stroke fill;">` +
-                `${escapeXml(
-                  textPart
-                )}` +
-                `</text>`
-            );
-          }
-
-          /*
-           * ===== EMOJI =====
-           */
-          if (
-            emojiParts.length > 0
-          ) {
-            const estimatedTextWidth =
-              Math.min(
-                textPart.length *
-                  fontSize *
-                  0.55,
-                FINAL_WIDTH -
-                  160
-              );
-
-            const emojiWidth =
-              fontSize * 0.85;
-
-            const emojiGap = 12;
-
-            const rightPadding =
-              50;
-
-            let emojiX =
-              centerX +
-              estimatedTextWidth /
-                2 +
-              emojiGap;
-
-            if (
-              emojiX +
-                emojiWidth >
-              FINAL_WIDTH -
-                rightPadding
-            ) {
-              emojiX =
-                FINAL_WIDTH -
-                rightPadding -
-                emojiWidth;
-            }
-
-            if (
-              emojiX <
-              rightPadding
-            ) {
-              emojiX =
-                rightPadding;
-            }
-
-            const emojiY =
-              y -
-              fontSize * 0.82;
-
-            let offsetX = 0;
-
-            for (const p of emojiParts) {
-              const dataUri =
-                await emojiDataUri(
-                  p.emoji
-                );
-
-              if (!dataUri) {
-                continue;
-              }
-
-              elements.push(
-                `<image ` +
-                  `x="${(
-                    emojiX +
-                    offsetX
-                  ).toFixed(2)}" ` +
-                  `y="${emojiY.toFixed(
-                    2
-                  )}" ` +
-                  `width="${emojiWidth.toFixed(
-                    2
-                  )}" ` +
-                  `height="${emojiWidth.toFixed(
-                    2
-                  )}" ` +
-                  `href="${dataUri}" ` +
-                  `preserveAspectRatio="xMidYMid meet"/>`
-              );
-
-              offsetX +=
-                emojiWidth + 6;
-            }
-          }
-
-          return `<g>${elements.join(
-            "\n"
-          )}</g>`;
-        }
-      )
+  /**
+   * Black outline layer.
+   */
+  const blackLayer =
+    await createTextLayer(
+      wrapped,
+      {
+        color: "#000000",
+        fontSize: fontSize + 5,
+        width: textWidth,
+        height: textHeight,
+      }
     );
 
-  /*
-   * ===== FONT EMBEDDING via @font-face =====
+  /**
+   * White main layer.
+   */
+  const whiteLayer =
+    await createTextLayer(
+      wrapped,
+      {
+        color: "#FFFFFF",
+        fontSize,
+        width: textWidth,
+        height: textHeight,
+      }
+    );
+
+  /**
+   * Slight translucent dark panel.
    *
-   * Ini adalah kunci fix untuk Vercel. Font TTF di-embed
-   * sebagai Base64 data URI, sehingga librsvg dapat
-   * merender teks tanpa bergantung pada fontconfig sistem.
+   * This makes white text readable on both light
+   * and dark images.
    */
-  const fontBase64 = getFontBase64();
+  const panelHeight =
+    lines.length >= 3 ? 360 : 300;
 
-  const fontFaceStyle =
-    fontBase64.length > 0
-      ? `<style type="text/css"><![CDATA[` +
-        `@font-face{` +
-        `font-family:'HeadlineFont';` +
-        `src:url(data:font/truetype;charset=utf-8;base64,${fontBase64}) format('truetype');` +
-        `font-weight:bold;` +
-        `font-style:normal;` +
-        `}` +
-        `]]></style>`
-      : "";
+  const panel =
+    await sharp({
+      create: {
+        width: FINAL_WIDTH,
+        height: panelHeight,
+        channels: 4,
+        background: {
+          r: 0,
+          g: 0,
+          b: 0,
+          alpha: 0.28,
+        },
+      },
+    })
+      .png()
+      .toBuffer();
 
-  if (!fontFaceStyle) {
-    console.error(
-      "[IMAGE] WARNING: Font Base64 tidak tersedia — headline mungkin " +
-        "akan dirender sebagai kotak kosong (tofu). Periksa log di atas."
-    );
-  }
-
-  const svg =
-    `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<svg ` +
-    `xmlns="http://www.w3.org/2000/svg" ` +
-    `xmlns:xlink="http://www.w3.org/1999/xlink" ` +
-    `width="${FINAL_WIDTH}" ` +
-    `height="${FINAL_HEIGHT}" ` +
-    `viewBox="0 0 ${FINAL_WIDTH} ${FINAL_HEIGHT}">` +
-    fontFaceStyle +
-    lineElements.join(
-      "\n"
-    ) +
-    `</svg>`;
-
-  return Buffer.from(
-    svg,
-    "utf8"
-  );
-}
-
-// ============================================================
-// APPLY HEADLINE OVERLAY
-// ============================================================
-
-async function applyHeadlineOverlay(
-  blob: Blob,
-  title: string
-): Promise<Blob> {
-  const cleanTitle =
-    cleanHeadline(title);
-
-  if (!cleanTitle) {
-    throw new Error(
-      "Cannot generate final image: Facebook headline/title is empty."
-    );
-  }
-
-  const inputBuffer =
-    Buffer.from(
-      await blob.arrayBuffer()
-    );
-
-  if (
-    inputBuffer.length ===
-    0
-  ) {
-    throw new Error(
-      "Cannot apply headline: source image is empty."
-    );
-  }
-
-  console.info(
-    `[IMAGE] OVERLAY START title="${cleanTitle}"`
-  );
-
-  const sharp =
-    await getSharp();
-
-  let baseImage: Buffer;
-
-  try {
-    baseImage =
-      await sharp(
-        inputBuffer
-      )
-        .rotate()
-        .resize(
-          FINAL_WIDTH,
-          FINAL_HEIGHT,
-          {
-            fit: "cover",
-            position:
-              "centre",
-            withoutEnlargement:
-              false,
-          }
-        )
-        .jpeg({
-          quality: 92,
-          mozjpeg: true,
-        })
-        .toBuffer();
-  } catch (error) {
-    throw new Error(
-      `Sharp could not process source image: ${
-        error instanceof Error
-          ? error.message
-          : String(error)
-      }`
-    );
-  }
-
-  if (
-    baseImage.length ===
-    0
-  ) {
-    throw new Error(
-      "Base image processing produced empty output."
-    );
-  }
-
-  const svgOverlay =
-    await createHeadlineSvg(
-      cleanTitle
-    );
-
-  if (
-    svgOverlay.length <
-    200
-  ) {
-    throw new Error(
-      `Headline SVG terlalu pendek (${svgOverlay.length} bytes) — kemungkinan gagal render text.`
-    );
-  }
-
-  const svgStr =
-    svgOverlay.toString("utf8");
-
-  if (
-    !svgStr.includes("<text")
-  ) {
-    throw new Error(
-      "Headline SVG tidak mengandung elemen <text>. Periksa cleanHeadline / wrapHeadline."
-    );
-  }
-
-  console.info(
-    `[IMAGE] SVG HEADLINE CREATED bytes=${svgOverlay.length} lines=${wrapHeadline(cleanTitle, HEADLINE_MAX_CHARS).length} fontEmbedded=${svgStr.includes("@font-face")}`
-  );
-
-  let outputBuffer: Buffer;
-
-  try {
-    outputBuffer =
-      await sharp(
-        baseImage
-      )
-        .composite([
-          {
-            input:
-              svgOverlay,
-            top: 0,
-            left: 0,
-          },
-        ])
-        .jpeg({
-          quality: 92,
-          mozjpeg: true,
-        })
-        .toBuffer();
-  } catch (error) {
-    throw new Error(
-      `Sharp headline composite failed: ${
-        error instanceof Error
-          ? error.message
-          : String(error)
-      }`
-    );
-  }
-
-  if (
-    outputBuffer.length ===
-    0
-  ) {
-    throw new Error(
-      "Headline overlay produced an empty image."
-    );
-  }
-
-  const metadata =
-    await sharp(
-      outputBuffer
-    ).metadata();
-
-  if (
-    metadata.width !==
-      FINAL_WIDTH ||
-    metadata.height !==
-      FINAL_HEIGHT
-  ) {
-    throw new Error(
-      `Final image dimensions are invalid. Expected ${FINAL_WIDTH}x${FINAL_HEIGHT}, got ${metadata.width ?? "unknown"}x${metadata.height ?? "unknown"}.`
-    );
-  }
-
-  console.info(
-    `[IMAGE] OVERLAY SUCCESS title="${cleanTitle}" width=${metadata.width} height=${metadata.height} bytes=${outputBuffer.length}`
-  );
-
-  return new Blob(
-    [
-      new Uint8Array(
-        outputBuffer
-      ),
-    ],
-    {
-      type:
-        "image/jpeg",
-    }
-  );
-}
-
-// ============================================================
-// PUBLIC GENERATOR
-// ============================================================
-
-export async function generateImage(
-  prompt: string,
-  pref: ImageSourcePref,
-  title: string
-): Promise<{
-  url: string;
-  source: ImageSource;
-}> {
-  const cleanPrompt =
-    prompt.trim();
-
-  const cleanTitle =
-    cleanHeadline(
-      title
-    );
-
-  if (!cleanPrompt) {
-    throw new Error(
-      "Image prompt is required."
-    );
-  }
-
-  if (!cleanTitle) {
-    throw new Error(
-      "Facebook headline/title is required for image generation."
-    );
-  }
-
-  const source =
-    resolveImageSource(
-      pref
-    );
-
-  console.info(
-    `[IMAGE] REQUESTED SOURCE=${source}`
-  );
-
-  console.info(
-    `[IMAGE] REQUIRED HEADLINE="${cleanTitle}"`
-  );
-
-  /*
-   * ==========================================================
-   * AI FIRST
-   * ==========================================================
+  /**
+   * Composite text toward the bottom.
    */
-  if (
-    source === "ai"
-  ) {
-    try {
-      const baseBlob =
-        await fetchGeminiImageBytes(
-          cleanPrompt,
-          cleanTitle
-        );
+  let output =
+    sharp(image).composite([
+      {
+        input: panel,
+        gravity: "south",
+      },
 
-      const finalBlob =
-        await applyHeadlineOverlay(
-          baseBlob,
-          cleanTitle
-        );
+      /**
+       * Black outline.
+       */
+      {
+        input: blackLayer,
+        gravity: "south",
+        top: -120,
+      },
 
-      return upload(
-        finalBlob,
-        "ai"
-      );
-    } catch (
-      geminiError
-    ) {
-      const message =
-        geminiError instanceof
-        Error
-          ? geminiError.message
-          : String(
-              geminiError
-            );
+      {
+        input: blackLayer,
+        gravity: "south",
+        top: -124,
+      },
 
-      console.error(
-        `[IMAGE] Gemini FAILED: ${message}`
-      );
+      {
+        input: blackLayer,
+        gravity: "south",
+        left: -3,
+        top: -122,
+      },
 
-      try {
-        const baseBlob =
-          await fetchStockImageBytes(
-            cleanPrompt
-          );
+      {
+        input: blackLayer,
+        gravity: "south",
+        left: 3,
+        top: -122,
+      },
 
-        const finalBlob =
-          await applyHeadlineOverlay(
-            baseBlob,
-            cleanTitle
-          );
+      /**
+       * White main text.
+       */
+      {
+        input: whiteLayer,
+        gravity: "south",
+        top: -122,
+      },
+    ]);
 
-        return upload(
-          finalBlob,
-          "stock"
-        );
-      } catch (
-        pexelsError
-      ) {
-        const message2 =
-          pexelsError instanceof
-          Error
-            ? pexelsError.message
-            : String(
-                pexelsError
-              );
+  /**
+   * Add one Twemoji image if the title contains emoji.
+   *
+   * Multiple emoji are intentionally combined into a
+   * compact visual row.
+   */
+  if (emoji.length > 0) {
+    const uniqueEmoji = [
+      ...new Set(emoji),
+    ].slice(0, 3);
 
-        console.error(
-          `[IMAGE] Pexels FALLBACK FAILED: ${message2}`
-        );
+    const emojiBuffers: Buffer[] = [];
 
-        throw new Error(
-          `Image generation failed. Gemini: ${message}. Pexels: ${message2}`
-        );
+    for (const item of uniqueEmoji) {
+      const buffer =
+        await fetchTwemoji(item);
+
+      if (buffer) {
+        emojiBuffers.push(buffer);
       }
     }
-  }
 
-  /*
-   * ==========================================================
-   * STOCK FIRST
-   * ==========================================================
-   */
-  try {
-    const baseBlob =
-      await fetchStockImageBytes(
-        cleanPrompt
-      );
+    if (emojiBuffers.length) {
+      const emojiSize =
+        lines.length >= 3 ? 58 : 66;
 
-    const finalBlob =
-      await applyHeadlineOverlay(
-        baseBlob,
-        cleanTitle
-      );
-
-    return upload(
-      finalBlob,
-      "stock"
-    );
-  } catch (
-    pexelsError
-  ) {
-    const message =
-      pexelsError instanceof
-      Error
-        ? pexelsError.message
-        : String(
-            pexelsError
-          );
-
-    console.error(
-      `[IMAGE] Pexels FAILED: ${message}`
-    );
-
-    try {
-      const baseBlob =
-        await fetchGeminiImageBytes(
-          cleanPrompt,
-          cleanTitle
+      const resized =
+        await Promise.all(
+          emojiBuffers.map((buffer) =>
+            sharp(buffer)
+              .resize({
+                width: emojiSize,
+                height: emojiSize,
+                fit: "contain",
+              })
+              .png()
+              .toBuffer()
+          )
         );
 
-      const finalBlob =
-        await applyHeadlineOverlay(
-          baseBlob,
-          cleanTitle
+      /**
+       * Build emoji strip.
+       */
+      const stripWidth =
+        resized.length * emojiSize +
+        Math.max(0, resized.length - 1) * 8;
+
+      let strip =
+        sharp({
+          create: {
+            width: stripWidth,
+            height: emojiSize,
+            channels: 4,
+            background: {
+              r: 0,
+              g: 0,
+              b: 0,
+              alpha: 0,
+            },
+          },
+        });
+
+      const emojiComposite =
+        resized.map(
+          (buffer, index) => ({
+            input: buffer,
+            left:
+              index *
+              (emojiSize + 8),
+            top: 0,
+          })
         );
 
-      return upload(
-        finalBlob,
-        "ai"
-      );
-    } catch (
-      geminiError
-    ) {
-      const message2 =
-        geminiError instanceof
-        Error
-          ? geminiError.message
-          : String(
-              geminiError
-            );
+      const stripBuffer =
+        await strip
+          .composite(emojiComposite)
+          .png()
+          .toBuffer();
 
-      console.error(
-        `[IMAGE] Gemini FALLBACK FAILED: ${message2}`
-      );
-
-      throw new Error(
-        `Image generation failed. Pexels: ${message}. Gemini: ${message2}`
-      );
+      output =
+        output.composite([
+          {
+            input: stripBuffer,
+            gravity: "south",
+            top: -35,
+          },
+        ]);
     }
   }
+
+  return output
+    .jpeg({
+      quality: 92,
+      chromaSubsampling: "4:4:4",
+      progressive: true,
+    })
+    .toBuffer();
 }
 
-// ============================================================
-// SUPABASE STORAGE
-// ============================================================
+/**
+ * ------------------------------------------------------------
+ * PREPARE FINAL IMAGE
+ * ------------------------------------------------------------
+ */
 
-async function upload(
-  blob: Blob,
-  source: ImageSource
-): Promise<{
-  url: string;
-  source: ImageSource;
-}> {
-  const db =
+async function composeFinalImage(
+  sourceImage: Buffer,
+  title?: string
+): Promise<Buffer> {
+  /**
+   * autoOrient:
+   * Prevents images with EXIF orientation from appearing
+   * rotated incorrectly.
+   *
+   * cover:
+   * Guarantees exactly 1080x1080.
+   */
+  const square =
+    await sharp(sourceImage)
+      .autoOrient()
+      .resize({
+        width: FINAL_WIDTH,
+        height: FINAL_HEIGHT,
+        fit: "cover",
+        position: "attention",
+        withoutEnlargement: false,
+      })
+      .flatten({
+        background: "#111111",
+      })
+      .jpeg({
+        quality: 94,
+        chromaSubsampling: "4:4:4",
+      })
+      .toBuffer();
+
+  return addHeadline(
+    square,
+    title
+  );
+}
+
+/**
+ * ------------------------------------------------------------
+ * SUPABASE UPLOAD
+ * ------------------------------------------------------------
+ */
+
+async function uploadImage(
+  image: Buffer
+): Promise<string> {
+  const supabase =
     supabaseAdmin();
 
-  const extension =
-    "jpg";
+  const now = new Date();
 
-  const date =
-    new Date()
-      .toISOString()
-      .slice(0, 10);
+  const datePath = [
+    now.getUTCFullYear(),
+    String(
+      now.getUTCMonth() + 1
+    ).padStart(2, "0"),
+    String(
+      now.getUTCDate()
+    ).padStart(2, "0"),
+  ].join("-");
 
-  const storagePath =
-    `${date}/${randomUUID()}.${extension}`;
-
-  const bytes =
-    new Uint8Array(
-      await blob.arrayBuffer()
-    );
-
-  if (
-    bytes.length ===
-    0
-  ) {
-    throw new Error(
-      "Cannot upload empty image."
-    );
-  }
-
-  console.info(
-    `[IMAGE] SUPABASE UPLOAD source=${source} path=${storagePath} size=${bytes.length}`
-  );
+  const filePath =
+    `${datePath}/${randomUUID()}.jpg`;
 
   const {
     error,
-  } =
-    await db.storage
-      .from(
-        STORAGE_BUCKET
-      )
-      .upload(
-        storagePath,
-        bytes,
-        {
-          contentType:
-            "image/jpeg",
-          cacheControl:
-            "31536000",
-          upsert: false,
-        }
-      );
+  } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(
+      filePath,
+      image,
+      {
+        contentType: "image/jpeg",
+        cacheControl: "31536000",
+        upsert: false,
+      }
+    );
 
   if (error) {
     throw new Error(
-      `Supabase Storage upload failed: ${error.message}`
+      `Supabase image upload failed: ${error.message}`
     );
   }
 
   const {
     data,
-  } =
-    db.storage
-      .from(
-        STORAGE_BUCKET
-      )
-      .getPublicUrl(
-        storagePath
-      );
+  } = supabase.storage
+    .from(STORAGE_BUCKET)
+    .getPublicUrl(filePath);
 
-  const publicUrl =
-    data?.publicUrl;
-
-  if (
-    typeof publicUrl !==
-      "string" ||
-    !publicUrl
-  ) {
+  if (!data.publicUrl) {
     throw new Error(
-      "Supabase did not return public image URL."
+      "Supabase did not return a public image URL."
     );
   }
 
-  console.info(
-    `[IMAGE] SUPABASE UPLOAD SUCCESS source=${source} url=${publicUrl}`
-  );
-
-  return {
-    url:
-      publicUrl,
-    source,
-  };
+  return data.publicUrl;
 }
+
+/**
+ * ------------------------------------------------------------
+ * MAIN GENERATOR
+ * ------------------------------------------------------------
+ */
+
+export async function generateImage(
+  prompt: string,
+  pref: ImageSourcePref,
+  title?: string
+): Promise<{
+  url: string;
+  source: ImageSource;
+}> {
+  if (!prompt?.trim()) {
+    throw new Error(
+      "Image prompt cannot be empty."
+    );
+  }
+
+  /**
+   * ----------------------------------------------------------
+   * AI FIRST
+   * ----------------------------------------------------------
+   */
+
+  if (pref === "ai") {
+    try {
+      console.log(
+        "[image] Generating image with Gemini..."
+      );
+
+      const source =
+        await generateWithGemini(
+          prompt,
+          title
+        );
+
+      console.log(
+        "[image] Gemini image received:",
+        source.length,
+        "bytes"
+      );
+
+      const finalImage =
+        await composeFinalImage(
+          source,
+          title
+        );
+
+      const url =
+        await uploadImage(
+          finalImage
+        );
+
+      console.log(
+        "[image] Gemini image uploaded:",
+        url
+      );
+
+      return {
+        url,
+        source: "ai",
+      };
+    } catch (error) {
+      console.error(
+        "[image] Gemini failed. Falling back to Pexels.",
+        error
+      );
+
+      /**
+       * Fallback to stock.
+       */
+      try {
+        const source =
+          await generateWithPexels(
+            prompt,
+            title
+          );
+
+        const finalImage =
+          await composeFinalImage(
+            source,
+            title
+          );
+
+        const url =
+          await uploadImage(
+            finalImage
+          );
+
+        return {
+          url,
+          source: "stock",
+        };
+      } catch (fallbackError) {
+        console.error(
+          "[image] Pexels fallback failed.",
+          fallbackError
+        );
+
+        throw new Error(
+          `Image generation failed. Gemini and Pexels both failed.`
+        );
+      }
+    }
+  }
+
+  /**
+   * ----------------------------------------------------------
+   * STOCK FIRST
+   * ----------------------------------------------------------
+   */
+
+  if (pref === "stock") {
+    try {
+      console.log(
+        "[image] Getting image from Pexels..."
+      );
+
+      const source =
+        await generateWithPexels(
+          prompt,
+          title
+        );
+
+      const finalImage =
+        await composeFinalImage(
+          source,
+          title
+        );
+
+      const url =
+        await uploadImage(
+          finalImage
+        );
+
+      console.log(
+        "[image] Pexels image uploaded:",
+        url
+      );
+
+      return {
+        url,
+        source: "stock",
+      };
+    } catch (error) {
+      console.error(
+        "[image] Pexels failed. Falling back to Gemini.",
+        error
+      );
+
+      try {
+        const source =
+          await generateWithGemini(
+            prompt,
+            title
+          );
+
+        const finalImage =
+          await composeFinalImage(
+            source,
+            title
+          );
+
+        const url =
+          await uploadImage(
+            finalImage
+          );
+
+        return {
+          url,
+          source: "ai",
+        };
+      } catch (fallbackError) {
+        console.error(
+          "[image] Gemini fallback failed.",
+          fallbackError
+        );
+
+        throw new Error(
+          "Image generation failed. Pexels and Gemini both failed."
+        );
+      }
+    }
+  }
+
+  /**
+   * ----------------------------------------------------------
+   * MIXED
+   * ----------------------------------------------------------
+   *
+   * Randomly chooses AI or stock.
+   */
+
+  const useAi =
+    Math.random() >= 0.5;
+
+  return generateImage(
+    prompt,
+    useAi ? "ai" : "stock",
+    title
+  );
+}
+
+/**
+ * ------------------------------------------------------------
+ * OPTIONAL DEFAULT EXPORT
+ * ------------------------------------------------------------
+ */
+
+export default generateImage;
